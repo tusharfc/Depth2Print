@@ -11,6 +11,8 @@ public struct TrackingStatus {
     public let rotationDegrees: Float
     /// Signed turn about gravity since the start (left/right for a face). 0 while gravity is unknown.
     public let headingDegrees: Float
+    /// Signed turn about the horizontal axis across the view since the start (chin up/down for a face).
+    public let tiltDegrees: Float
     public let degreesPerSecond: Float
     /// False when the latest frame could not be aligned.
     public let isTracking: Bool
@@ -69,6 +71,7 @@ final class FrameTracker: @unchecked Sendable {
     /// Sum of per-frame "up" (against gravity) in world space; averaged rather than taken from one shaky sample.
     private var upSum = SIMD3<Float>(repeating: 0)
     private var heading: Float = 0
+    private var tilt: Float = 0
     private struct View { var origin: SIMD3<Float>; var edges: [SIMD3<Float>] }
     private var views: [View] = []
     /// Where the camera was, in world space, for every tracked frame.
@@ -169,7 +172,14 @@ final class FrameTracker: @unchecked Sendable {
             linearVelocity += (SIMD3(motion.columns.3.x, motion.columns.3.y, motion.columns.3.z) / dt - linearVelocity) * blend
         }
         netRotation += Self.upperLeft(pose) * rotation
-        if let up { heading += dot(Self.upperLeft(pose) * rotation, up) }
+        if let up {
+            let turn = Self.upperLeft(pose) * rotation
+            heading += dot(turn, up)
+            // The horizontal axis across the view: nodding turns about it.
+            let right = SIMD3(pose.columns.0.x, pose.columns.0.y, pose.columns.0.z)
+            let across = right - dot(right, up) * up
+            if length(across) > 0.3 { tilt += dot(turn, normalize(across)) }
+        }
         pose = Self.orthonormalized(pose * motion)
         try fuse(source, into: volume, model: model, intrinsics: intrinsics, time: time)
         record(gravity: gravity, intrinsics: intrinsics, width: depth.width, height: depth.height)
@@ -418,6 +428,7 @@ final class FrameTracker: @unchecked Sendable {
 
     private func status(isTracking: Bool, rmse: Float) -> TrackingStatus {
         TrackingStatus(pose: pose, rotationDegrees: length(netRotation) * 180 / .pi, headingDegrees: heading * 180 / .pi,
+                       tiltDegrees: tilt * 180 / .pi,
                        degreesPerSecond: length(angularVelocity) * 180 / .pi, isTracking: isTracking,
                        framesTracked: tracked, framesLost: lost, rmse: rmse, failureReason: failure,
                        processingMilliseconds: (ProcessInfo.processInfo.systemUptime - processingStarted) * 1000,

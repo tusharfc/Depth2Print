@@ -229,6 +229,7 @@ func runScenario(_ name: String, mode: ScanMode, frames: Int, scene: (Int) -> (g
     var seconds = 0.0
     var previewIoU: Double?
     var last: TrackingStatus?
+    var headingRange: (Float, Float) = (0, 0), tiltRange: (Float, Float) = (0, 0)
     for k in 0...frames {
         let s = scene(k)
         if k == 0 { first = s.subject }
@@ -241,6 +242,8 @@ func runScenario(_ name: String, mode: ScanMode, frames: Int, scene: (Int) -> (g
                                        color: { renderColor(s.groups, width: $0, height: $1) })
         seconds += Date().timeIntervalSince(start)
         last = status
+        headingRange = (min(headingRange.0, status.headingDegrees), max(headingRange.1, status.headingDegrees))
+        tiltRange = (min(tiltRange.0, status.tiltDegrees), max(tiltRange.1, status.tiltDegrees))
         let truthPose = first * s.subject.inverse
         if status.isTracking {
             maxPoseError = max(maxPoseError, length(FrameTracker.rotationVector(status.pose.inverse * truthPose)) * 180 / .pi)
@@ -268,6 +271,8 @@ func runScenario(_ name: String, mode: ScanMode, frames: Int, scene: (Int) -> (g
     if let s = last {
         print(String(format: "  tracking: rotation %.1f°, max pose error %.2f°, lost %d, %.1f ms/frame on this Mac",
                      s.rotationDegrees, maxPoseError, s.framesLost, seconds / Double(frames + 1) * 1000))
+        print(String(format: "  turned %.0f° to %.0f°, tilted %.0f° to %.0f°", headingRange.0, headingRange.1,
+                     tiltRange.0, tiltRange.1))
     }
     let world: Mesh
     do { world = try tracker.worldMesh(); _ = try tracker.extractMesh() } catch {
@@ -368,7 +373,7 @@ func runSynthetic() throws {
             return ([Group(shapes: person, toCamera: m)], m)
         }, truth: { p in person.map { $0.sdf(p) }.min()! })
     }
-    if enabled("face") || enabled("face-low") {
+    if enabled("face") || enabled("face-low") || enabled("face-nod") {
         // Head turns ±60° in front of a still phone; shoulders stay put. Cheek bumps 6 mm wide and 4 mm high
         // measure how much fine detail survives.
         let bumps = [SIMD3<Float>(0.04, -0.02, 0.0745), SIMD3<Float>(-0.04, -0.02, 0.0745)]
@@ -383,20 +388,32 @@ func runSynthetic() throws {
             Region(name: "nose", contains: { distance($0, nose + SIMD3(0, 0, 0.02)) < 0.02 }),
             Region(name: "cheek bumps", contains: { p in bumps.contains { distance(p, $0) < 0.01 } }),
             Region(name: "chin", contains: { p in p.y < -0.085 && p.y > -0.11 && p.z > 0.03 && abs(p.x) < 0.03 }),
+            // Faces down, so a level camera only grazes it.
+            Region(name: "under chin", contains: { p in p.y < -0.07 && p.y > -0.13 && p.z > 0.055 && abs(p.x) < 0.04 }),
         ]
         // "face": phone level with the eyes. "face-low": portrait phone held 8 cm below the eyes and tilted up, so
         // the chest is in view and nearer to it than the nose (the case that used to scan the shirt).
+        // "face-nod": level phone; the head turns left/right, then tilts chin up/down.
         let setups: [(String, SIMD3<Float>, Float, Float, Float)] = [("face", SIMD3(0, 0, 0.4), 0, 0, 0.1),
-                                                                    ("face-low", SIMD3(0, -0.08, 0.35), 0.15, .pi / 2, 0.13)]
+                                                                    ("face-low", SIMD3(0, -0.08, 0.35), 0.15, .pi / 2, 0.13),
+                                                                    ("face-nod", SIMD3(0, 0, 0.4), 0, 0, 0.1)]
         for (name, origin, tilt, roll, chest) in setups where enabled(name) {
             let torso: [Shape] = [.box(SIMD3(-0.18, -0.45, -0.1), SIMD3(0.18, -0.17, chest))]
             let level = simd_float4x4(columns: (SIMD4(1, 0, 0, 0), SIMD4(0, -1, 0, 0), SIMD4(0, 0, -1, 0), SIMD4(origin, 1)))
             // Tilting the phone up rotates the scene about the camera's x axis; portrait rolls it about z.
             let headBase = ICP.rigid(rotation: SIMD3(0, 0, roll), translation: .zero)
                 * ICP.rigid(rotation: SIMD3(-tilt, 0, 0), translation: .zero) * level
-            try runScenario(name, mode: .face, frames: 240, scene: { k in
-                let angle = 60 * Float.pi / 180 * sin(2 * .pi * Float(k) / 240)
-                let m = headBase * translate(neck) * rotY(angle) * translate(-neck)
+            let nods = name == "face-nod"
+            let pivot = SIMD3<Float>(0, -0.1, -0.02)   // nodding turns about the upper neck
+            try runScenario(name, mode: .face, frames: nods ? 400 : 240, scene: { k in
+                var m = headBase
+                if !nods || k < 240 {
+                    let angle = (nods ? 50 : 60) * Float.pi / 180 * sin(2 * .pi * Float(k) / 240)
+                    m = m * translate(neck) * rotY(angle) * translate(-neck)
+                } else {
+                    let angle = 25 * Float.pi / 180 * sin(2 * .pi * Float(k - 240) / 160)
+                    m = m * translate(pivot) * ICP.rigid(rotation: SIMD3(angle, 0, 0), translation: .zero) * translate(-pivot)
+                }
                 return ([Group(shapes: head, toCamera: m), Group(shapes: torso, toCamera: headBase)], m)
             }, truth: { p in head.map { $0.sdf(p) }.min()! },
                evaluate: { p in p.z > 0.04 && p.y > -0.06 },   // what the camera saw, not the flat back

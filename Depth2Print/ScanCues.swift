@@ -15,6 +15,7 @@ final class ScanCues {
     private var nextMilestone: Float = 90
     private var faceStage = 0
     private var firstSide: Float = 0
+    private var firstTilt: Float = 0
     private var lastSaid: [String: Date] = [:]
 
     // On a tripod a vibration would shake the camera mid-scan.
@@ -97,9 +98,18 @@ final class ScanCues {
             faceStage = 1
         case 1 where heading * firstSide <= -45:
             tick()
+            say("Now face the camera and slowly tilt your chin up.")
+            faceStage = 2
+        case 2 where abs(status.tiltDegrees) >= 20:
+            firstTilt = status.tiltDegrees < 0 ? -1 : 1
+            tick()
+            say("Now slowly tilt your chin down.")
+            faceStage = 3
+        case 3 where status.tiltDegrees * firstTilt <= -20:
+            tick()
             say("Good. Face the camera, then tap Finish.")
             vibrate(.success)
-            faceStage = 2
+            faceStage = 4
         default:
             break
         }
