@@ -24,9 +24,9 @@ struct CameraIntrinsics {
 // Layouts must match the structs in ICP.metal.
 private struct DepthFilterParams {
     var k: CameraIntrinsics
-    var plane: SIMD4<Float>
+    var planes: (SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>)
     var region: SIMD4<Float>
-    var minDepth, maxDepth, sigmaSpace, sigmaDepth, planeMargin: Float
+    var minDepth, maxDepth, sigmaSpace, sigmaDepth: Float
 }
 
 private struct DownsampleParams {
@@ -90,12 +90,14 @@ struct ICPResult {
     var transform: simd_float4x4
     var inliers: Int
     var rmse: Float
+    /// Of the frame's points that landed on the model's surface, the share that matched it (full resolution).
+    var coverage: Float
 }
 
 /// Parts of the current depth frame to hide from tracking and fusion, in that frame's camera space.
 struct DepthMask {
-    /// (n, d) with n pointing to the kept side; points with n·p + d below the margin are dropped.
-    var plane: SIMD4<Float>?
+    /// Up to four (n, d) with n pointing to the kept side; points with n·p + d < 0 are dropped.
+    var planes: [SIMD4<Float>] = []
     /// (center, radius); points outside the sphere are dropped.
     var region: SIMD4<Float>?
 }
@@ -145,7 +147,7 @@ final class ICP {
     private var partials: MTLBuffer?
     private let totals: MTLBuffer?
 
-    private static let terms = 29
+    private static let terms = 30
     private static let reduceGroup = MTLSize(width: 16, height: 8, depth: 1)
     private static let imageGroup = MTLSize(width: 16, height: 16, depth: 1)
 
@@ -180,9 +182,11 @@ final class ICP {
         guard let commands = queue.makeCommandBuffer(),
               let encoder = commands.makeComputeCommandEncoder() else { throw DepthEngineError.metalUnavailable }
 
-        var filter = DepthFilterParams(k: intrinsics, plane: mask.plane ?? .zero, region: mask.region ?? .zero,
+        precondition(mask.planes.count <= 4)
+        let p = mask.planes + Array(repeating: SIMD4<Float>.zero, count: 4 - mask.planes.count)
+        var filter = DepthFilterParams(k: intrinsics, planes: (p[0], p[1], p[2], p[3]), region: mask.region ?? .zero,
                                        minDepth: config.depthRange.lowerBound, maxDepth: config.depthRange.upperBound,
-                                       sigmaSpace: 1.5, sigmaDepth: 0.005, planeMargin: config.planeMargin)
+                                       sigmaSpace: 1.5, sigmaDepth: 0.005)
         encoder.setComputePipelineState(bilateral)
         encoder.setTexture(depth, index: 0)
         encoder.setBytes(&filter, length: MemoryLayout<DepthFilterParams>.stride, index: 0)
@@ -247,6 +251,7 @@ final class ICP {
         precondition(source.width == reference.width && source.height == reference.height)
         var transform = initial
         var inliers = 0
+        var sourcePoints = 0
         var error = 0.0
         lastFailure = nil
 
@@ -259,6 +264,7 @@ final class ICP {
                     return nil
                 }
                 inliers = system.inliers
+                sourcePoints = system.sourcePoints
                 error = system.error
 
                 let step = axis.map { Self.solveAboutAxis(system, $0) }
@@ -277,7 +283,8 @@ final class ICP {
                 if length(rotation) < 1e-5 && length(translation) < 1e-6 { break }
             }
         }
-        return ICPResult(transform: transform, inliers: inliers, rmse: Float((error / Double(inliers)).squareRoot()))
+        return ICPResult(transform: transform, inliers: inliers, rmse: Float((error / Double(inliers)).squareRoot()),
+                         coverage: Float(inliers) / Float(max(sourcePoints, 1)))
     }
 
     // MARK: - Internals
@@ -287,6 +294,7 @@ final class ICP {
         var atb = [Double](repeating: 0, count: 6)
         var error = 0.0
         var inliers = 0
+        var sourcePoints = 0
     }
 
     private func normalEquations(_ src: FramePyramid.Level, _ ref: FramePyramid.Level,
@@ -343,6 +351,7 @@ final class ICP {
         for a in 0..<6 { system.atb[a] = sums[21 + a] }
         system.error = sums[27]
         system.inliers = Int(sums[28])
+        system.sourcePoints = Int(sums[29])
         return system
     }
 

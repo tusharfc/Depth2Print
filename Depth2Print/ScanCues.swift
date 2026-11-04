@@ -90,13 +90,14 @@ final class ScanCues {
     private func guideFace(_ status: TrackingStatus) {
         // Without gravity the heading stays 0; fall back to unsigned rotation for the first side only.
         let heading = status.headingDegrees != 0 ? status.headingDegrees : status.rotationDegrees
+        // Ears face sideways: they need ~60° turns.
         switch faceStage {
-        case 0 where abs(heading) >= 45:
+        case 0 where abs(heading) >= 60:
             firstSide = heading < 0 ? -1 : 1
             tick()
             say("Now slowly turn to the other side.")
             faceStage = 1
-        case 1 where heading * firstSide <= -45:
+        case 1 where heading * firstSide <= -60:
             tick()
             say("Now face the camera and slowly tilt your chin up.")
             faceStage = 2

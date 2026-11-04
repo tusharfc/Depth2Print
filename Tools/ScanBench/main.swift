@@ -142,7 +142,18 @@ struct Group {
     var toCamera: simd_float4x4
 }
 
-var rng = SystemRandomNumberGenerator()
+/// SEED=n makes the sensor noise repeatable, so a failing run can be traced.
+struct SeededRandom: RandomNumberGenerator {
+    var state: UInt64
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
+    }
+}
+var rng = SeededRandom(state: environment["SEED"].flatMap(UInt64.init) ?? UInt64.random(in: 0...UInt64.max))
 func gaussian() -> Float {
     let u1 = Float.random(in: Float.ulpOfOne..<1, using: &rng), u2 = Float.random(in: 0..<1, using: &rng)
     return (-2 * log(u1)).squareRoot() * cos(2 * .pi * u2)
@@ -230,8 +241,13 @@ func runScenario(_ name: String, mode: ScanMode, frames: Int, scene: (Int) -> (g
     var previewIoU: Double?
     var last: TrackingStatus?
     var headingRange: (Float, Float) = (0, 0), tiltRange: (Float, Float) = (0, 0)
+    var coverages: [Float] = []
     for k in 0...frames {
-        let s = scene(k)
+        var s = scene(k)
+        // WALL=z adds a flat wall at camera depth z (static camera modes: it stays put while the subject moves).
+        if let wall = environment["WALL"].flatMap(Float.init) {
+            s.groups.append(Group(shapes: [.plane(SIMD3(0, 0, -1), wall)], toCamera: matrix_identity_float4x4))
+        }
         if k == 0 { first = s.subject }
         let depth = render(s.groups)
         let up = s.subject * SIMD4<Float>(0, 1, 0, 0)
@@ -242,20 +258,29 @@ func runScenario(_ name: String, mode: ScanMode, frames: Int, scene: (Int) -> (g
                                        color: { renderColor(s.groups, width: $0, height: $1) })
         seconds += Date().timeIntervalSince(start)
         last = status
+        if status.isTracking && status.coverage > 0 { coverages.append(status.coverage) }
         headingRange = (min(headingRange.0, status.headingDegrees), max(headingRange.1, status.headingDegrees))
         tiltRange = (min(tiltRange.0, status.tiltDegrees), max(tiltRange.1, status.tiltDegrees))
         let truthPose = first * s.subject.inverse
         if status.isTracking {
             maxPoseError = max(maxPoseError, length(FrameTracker.rotationVector(status.pose.inverse * truthPose)) * 180 / .pi)
         }
-        if tracing { print(String(format: "  k=%d %@ rot=%.1f rmse=%.2fmm %@", k, status.isTracking ? "ok  " : "LOST",
-                                  status.rotationDegrees, status.rmse * 1000, status.failureReason ?? "")) }
+        if tracing {
+            let error = status.isTracking ? length(FrameTracker.rotationVector(status.pose.inverse * truthPose)) * 180 / .pi : 0
+            print(String(format: "  k=%d %@ rot=%.1f rmse=%.2fmm cover=%.0f%% err=%.2f° %@", k,
+                         status.isTracking ? "ok  " : "LOST", status.rotationDegrees, status.rmse * 1000,
+                         status.coverage * 100, error, status.failureReason ?? ""))
+        }
         if k >= frames / 3, previewIoU == nil, let image = status.preview {
             previewIoU = overlap(image, subject: s.groups[0], full: depth)
         }
     }
 
     print("== \(name) (\(mode))")
+    for plane in tracker.detectedBackground {
+        print(String(format: "  background plane: normal (%.2f, %.2f, %.2f), %.0f mm from camera",
+                     plane.normal.x, plane.normal.y, plane.normal.z, plane.offset * 1000))
+    }
     if let region = tracker.detectedHead.region {
         // Ground truth in the subject's frame: head center at the origin, crown at y = 0.11, chin at y = -0.11.
         let c = first.inverse * SIMD4(region.x, region.y, region.z, 1)
@@ -273,6 +298,11 @@ func runScenario(_ name: String, mode: ScanMode, frames: Int, scene: (Int) -> (g
                      s.rotationDegrees, maxPoseError, s.framesLost, seconds / Double(frames + 1) * 1000))
         print(String(format: "  turned %.0f° to %.0f°, tilted %.0f° to %.0f°", headingRange.0, headingRange.1,
                      tiltRange.0, tiltRange.1))
+        let c = coverages.sorted()
+        if !c.isEmpty {
+            print(String(format: "  coverage: min %.0f%%, 1%% %.0f%%, median %.0f%%", c[0] * 100, c[c.count / 100] * 100,
+                         c[c.count / 2] * 100))
+        }
     }
     let world: Mesh
     do { world = try tracker.worldMesh(); _ = try tracker.extractMesh() } catch {
@@ -378,11 +408,13 @@ func runSynthetic() throws {
         // measure how much fine detail survives.
         let bumps = [SIMD3<Float>(0.04, -0.02, 0.0745), SIMD3<Float>(-0.04, -0.02, 0.0745)]
         let nose = SIMD3<Float>(0, -0.01, 0.09)
+        // Ears stick out ~1.5 cm, centered a little behind the head's middle.
+        let ears = [SIMD3<Float>(0.08, -0.005, -0.01), SIMD3<Float>(-0.08, -0.005, -0.01)]
         let head: [Shape] = [
             .ellipsoid(.zero, SIMD3(0.075, 0.11, 0.095)),
             .ellipsoid(nose, SIMD3(0.012, 0.025, 0.022)),
             .cylinder(radius: 0.05, y0: -0.2, y1: -0.06),
-        ] + bumps.map { .sphere($0, 0.006) }
+        ] + bumps.map { .sphere($0, 0.006) } + ears.map { .ellipsoid($0, SIMD3(0.012, 0.03, 0.02)) }
         let neck = SIMD3<Float>(0, 0, -0.02)
         let details = [
             Region(name: "nose", contains: { distance($0, nose + SIMD3(0, 0, 0.02)) < 0.02 }),
@@ -390,15 +422,18 @@ func runSynthetic() throws {
             Region(name: "chin", contains: { p in p.y < -0.085 && p.y > -0.11 && p.z > 0.03 && abs(p.x) < 0.03 }),
             // Faces down, so a level camera only grazes it.
             Region(name: "under chin", contains: { p in p.y < -0.07 && p.y > -0.13 && p.z > 0.055 && abs(p.x) < 0.04 }),
+            // The outer side of each ear (|x| beyond the skull).
+            Region(name: "ears", contains: { p in abs(p.x) > 0.08 && abs(p.y + 0.005) < 0.03 && abs(p.z + 0.01) < 0.02 }),
         ]
         // "face": phone level with the eyes. "face-low": portrait phone held 8 cm below the eyes and tilted up, so
         // the chest is in view and nearer to it than the nose (the case that used to scan the shirt).
         // "face-nod": level phone; the head turns left/right, then tilts chin up/down.
         let setups: [(String, SIMD3<Float>, Float, Float, Float)] = [("face", SIMD3(0, 0, 0.4), 0, 0, 0.1),
-                                                                    ("face-low", SIMD3(0, -0.08, 0.35), 0.15, .pi / 2, 0.13),
+                                                                    ("face-low", SIMD3(0, -0.08, 0.35), 0.15, .pi / 2, 0.15),
                                                                     ("face-nod", SIMD3(0, 0, 0.4), 0, 0, 0.1)]
         for (name, origin, tilt, roll, chest) in setups where enabled(name) {
-            let torso: [Shape] = [.box(SIMD3(-0.18, -0.45, -0.1), SIMD3(0.18, -0.17, chest))]
+            // The collar sits ~11 cm below the chin (y = -0.11).
+            let torso: [Shape] = [.box(SIMD3(-0.18, -0.5, -0.1), SIMD3(0.18, -0.22, chest))]
             let level = simd_float4x4(columns: (SIMD4(1, 0, 0, 0), SIMD4(0, -1, 0, 0), SIMD4(0, 0, -1, 0), SIMD4(origin, 1)))
             // Tilting the phone up rotates the scene about the camera's x axis; portrait rolls it about z.
             let headBase = ICP.rigid(rotation: SIMD3(0, 0, roll), translation: .zero)

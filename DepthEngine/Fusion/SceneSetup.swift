@@ -15,6 +15,15 @@ enum SceneSetup {
     struct Points {
         var positions: [SIMD3<Float>] = []
         var normals: [SIMD3<Float>] = []
+
+        func filter(_ keep: (SIMD3<Float>) -> Bool) -> Points {
+            var kept = Points()
+            for (p, n) in zip(positions, normals) where keep(p) {
+                kept.positions.append(p)
+                kept.normals.append(n)
+            }
+            return kept
+        }
     }
 
     /// Valid points with normals from one pyramid level, thinned to at most `maxCount`.
@@ -110,6 +119,27 @@ enum SceneSetup {
         // The skull's middle is ~11 cm below the crown, whatever the camera's tilt.
         center += up * ((crown - 0.11) - dot(center, up))
         return Head(region: SIMD4(center, 0.17), neck: Plane(normal: up, offset: -(crown - 0.27)))
+    }
+
+    /// Large flat surfaces with almost nothing visible behind them (a wall, a door, a headboard), with the
+    /// subject in front. Planes parallel to `support` are left to the support-plane logic.
+    static func backgroundPlanes(_ points: Points, excluding support: Plane?) -> [Plane] {
+        let total = points.positions.count
+        guard total >= 200 else { return [] }
+        var rng = SplitMix(state: 0xD1B5_4A32_D192_ED03)
+        var remaining = Array(points.positions.indices)
+        var planes: [Plane] = []
+        for _ in 0..<4 {
+            guard let (plane, inliers) = ransac(points, remaining, &rng), inliers.count >= max(150, total / 10) else { break }
+            let removed = Set(inliers)
+            remaining.removeAll { removed.contains($0) }
+            if let support, abs(dot(plane.normal, support.normal)) > 0.95 { continue }
+            let distances = points.positions.map { plane.distance($0) }
+            let inFront = distances.filter { $0 > 0.01 }.count
+            let behind = distances.filter { $0 < -0.01 }.count
+            if inFront >= 100 && behind <= max(10, inFront / 50) { planes.append(plane) }
+        }
+        return planes
     }
 
     static func volumeCenter(_ points: Points, plane: Plane?, size: Float) -> SIMD3<Float>? {

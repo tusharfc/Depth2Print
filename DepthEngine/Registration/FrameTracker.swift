@@ -20,6 +20,8 @@ public struct TrackingStatus {
     public let framesLost: Int
     /// Point-to-plane residual of the last alignment, meters.
     public let rmse: Float
+    /// Share of the frame's points that landed on the model in the last alignment (0...1).
+    public let coverage: Float
     /// Why the latest frame couldn't be aligned (nil while tracking).
     public let failureReason: String?
     /// Time the phone spent on this frame. Frames arriving meanwhile are skipped, so this sets the tracking rate.
@@ -56,6 +58,9 @@ final class FrameTracker: @unchecked Sendable {
     private var lost = 0
 
     private var supportPlane: Plane?
+    /// Walls and the like behind the subject (first camera's space), hidden from tracking and fusion.
+    private var backgroundPlanes: [Plane] = []
+    private static let backgroundMargin: Float = 0.015
     /// Where the mesh is cut flat and which side is kept; its normal becomes "up" for printing.
     private var cutPlane: Plane?
     private var headRegion: SIMD4<Float>?
@@ -155,10 +160,27 @@ final class FrameTracker: @unchecked Sendable {
         // If the motion prior is off (a jolt, or the user paused), retry from the last good pose: that is also how
         // tracking recovers once the user moves back to where it was lost.
         guard let result = try timed("icp", {
-            try icp.align(source: source, reference: model, initial: guess, axis: axis)
-                ?? icp.align(source: source, reference: model, initial: matrix_identity_float4x4, axis: axis)
+            // Converging far from where it started (the predicted motion, or for the retry the last pose) means a
+            // wrong fit, e.g. a symmetric part slipping into place; fusing it would smear the model.
+            func plausible(_ result: ICPResult?, from start: simd_float4x4) -> ICPResult? {
+                guard let result else { return nil }
+                let correction = result.transform * start.inverse
+                let t = correction.columns.3
+                // Translation gets the full step: turning about a distant pivot (a neck) moves the camera a lot.
+                guard length(Self.rotationVector(correction)) < icp.config.maxStepRotation / 2,
+                      length(SIMD3(t.x, t.y, t.z)) < icp.config.maxStepTranslation else {
+                    failure = "lost: moving too fast"
+                    return nil
+                }
+                return result
+            }
+            if let fromGuess = plausible(try icp.align(source: source, reference: model, initial: guess, axis: axis),
+                                         from: guess) { return fromGuess }
+            // Retry from the last good pose: that is how tracking recovers once the user moves back there.
+            return plausible(try icp.align(source: source, reference: model, initial: matrix_identity_float4x4, axis: axis),
+                             from: matrix_identity_float4x4)
         }) else {
-            failure = icp.lastFailure
+            failure = failure ?? icp.lastFailure
             lost += 1
             return status(isTracking: false, rmse: 0)
         }
@@ -187,7 +209,7 @@ final class FrameTracker: @unchecked Sendable {
         tracked += 1
 
         if profile.locksTurntableAxis { updateTurntableAxis(volume, rmse: result.rmse, turned: length(rotation)) }
-        return status(isTracking: true, rmse: result.rmse)
+        return status(isTracking: true, rmse: result.rmse, coverage: result.coverage)
     }
 
     /// Locks rotation to the turntable axis once 45° of free tracking pins it down, and unlocks again if the
@@ -231,6 +253,7 @@ final class FrameTracker: @unchecked Sendable {
     }
 
     var detectedSupportPlane: Plane? { supportPlane }
+    var detectedBackground: [Plane] { backgroundPlanes }
     var detectedHead: (region: SIMD4<Float>?, neck: Plane?) { (headRegion, neckPlane) }
     var isAxisLocked: Bool { turntableAxis != nil }
     /// Tests turn this off to track frames against the model without adding them to it.
@@ -298,9 +321,12 @@ final class FrameTracker: @unchecked Sendable {
     private func start(_ source: FramePyramid, _ model: FramePyramid, depth: MTLTexture, intrinsics: CameraIntrinsics,
                        time: Double, gravity: SIMD3<Float>?, color: ColorSampler?) throws -> TrackingStatus {
         try icp.build(source, depth: depth, intrinsics: intrinsics)
-        let points = SceneSetup.points(source.levels[1])
+        var points = SceneSetup.points(source.levels[1])
         let upHere = gravity.flatMap { length($0) > 0.5 ? normalize(-$0) : nil }
         if profile.findsSupportPlane { supportPlane = SceneSetup.supportPlane(points, up: upHere) }
+        backgroundPlanes = Array(SceneSetup.backgroundPlanes(points, excluding: supportPlane).prefix(2))
+        // A wall right behind the subject must not be mistaken for the top of a head or pull the volume toward it.
+        points = points.filter { p in backgroundPlanes.allSatisfy { $0.distance(p) > Self.backgroundMargin } }
         if profile.isolatesHead, let head = SceneSetup.head(points, up: upHere) {
             headRegion = head.region
             neckPlane = head.neck
@@ -316,12 +342,12 @@ final class FrameTracker: @unchecked Sendable {
         // A few mm above the support plane so table noise doesn't leave a film under the object.
         cutPlane = supportPlane.map { Plane(normal: $0.normal, offset: $0.offset - 0.003) }
         if headRegion != nil {
-            // The back of the head is never seen; keep the front half as a flat-backed relief.
-            cutPlane = Plane(normal: SIMD3(0, 0, -1), offset: center.z)
+            // The back of the head is never seen; keep a flat-backed relief, deep enough to include the ears.
+            cutPlane = Plane(normal: SIMD3(0, 0, -1), offset: center.z + 0.06)
         }
 
         let firstMask = mask(cameraToWorld: pose)
-        if firstMask.plane != nil || firstMask.region != nil {
+        if !firstMask.planes.isEmpty || firstMask.region != nil {
             try icp.build(source, depth: depth, intrinsics: intrinsics, mask: firstMask)
         }
         // A face keeps only its front half, so shift the volume toward the camera to spend voxels there.
@@ -337,14 +363,20 @@ final class FrameTracker: @unchecked Sendable {
 
     private func mask(cameraToWorld: simd_float4x4) -> DepthMask {
         var mask = DepthMask()
+        func keep(_ plane: SIMD4<Float>, margin: Float) { mask.planes.append(plane - SIMD4(0, 0, 0, margin)) }
         // The camera doesn't move on a turntable, so the first frame's plane stays put in camera space.
-        if profile.masksSupportPlane { mask.plane = supportPlane?.vector }
+        if profile.masksSupportPlane, let plane = supportPlane { keep(plane.vector, margin: icp.config.planeMargin) }
+        for plane in backgroundPlanes {
+            // Walls are fixed in the room: in camera space when the phone stays put, in world space when it moves.
+            keep(profile.cameraStaysStill ? plane.vector : Self.cameraSpace(plane, cameraToWorld: cameraToWorld),
+                 margin: Self.backgroundMargin)
+        }
         if let head = headRegion {
             let c = cameraToWorld.inverse * SIMD4(head.x, head.y, head.z, 1)
             mask.region = SIMD4(c.x, c.y, c.z, head.w)
         }
         // The chest stays still while the head turns, so it must not take part in tracking either.
-        if let neckPlane { mask.plane = Self.cameraSpace(neckPlane, cameraToWorld: cameraToWorld) }
+        if let neckPlane { keep(Self.cameraSpace(neckPlane, cameraToWorld: cameraToWorld), margin: icp.config.planeMargin) }
         return mask
     }
 
@@ -426,11 +458,11 @@ final class FrameTracker: @unchecked Sendable {
         modelIsCurrent = true
     }
 
-    private func status(isTracking: Bool, rmse: Float) -> TrackingStatus {
+    private func status(isTracking: Bool, rmse: Float, coverage: Float = 0) -> TrackingStatus {
         TrackingStatus(pose: pose, rotationDegrees: length(netRotation) * 180 / .pi, headingDegrees: heading * 180 / .pi,
                        tiltDegrees: tilt * 180 / .pi,
                        degreesPerSecond: length(angularVelocity) * 180 / .pi, isTracking: isTracking,
-                       framesTracked: tracked, framesLost: lost, rmse: rmse, failureReason: failure,
+                       framesTracked: tracked, framesLost: lost, rmse: rmse, coverage: coverage, failureReason: failure,
                        processingMilliseconds: (ProcessInfo.processInfo.systemUptime - processingStarted) * 1000,
                        stageTimings: stages.map { String(format: "%@ %.0f", $0.name, $0.ms) }.joined(separator: " · "),
                        preview: preview)

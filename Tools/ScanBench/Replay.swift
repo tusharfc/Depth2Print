@@ -68,9 +68,12 @@ func replay(_ directory: URL) throws {
     }
     var referenceFrames: [(pose: simd_float4x4, k: CameraIntrinsics, depth: [Float])] = []
     var fed = 0
+    var coverages: [Float] = []
     var last: TrackingStatus?
     for (index, frame) in frames.enumerated() where !onlyDeviceFrames || processedTimes.contains((frame.time * 1000).rounded()) {
         if let window, !window.contains(index) { continue }
+        // STRIDE=n feeds every n-th frame: the same scan moved n times faster.
+        if let stride = environment["STRIDE"].flatMap(Int.init), index % stride != 0 { continue }
         // HOLDOUT=first,count tracks those frames without fusing them (pair with REFERENCE for a fair test).
         if let holdout = environment["HOLDOUT"]?.split(separator: ",").compactMap({ Int($0) }) {
             tracker.fusesFrames = !(holdout[0]..<(holdout[0] + holdout[1])).contains(index)
@@ -98,15 +101,22 @@ func replay(_ directory: URL) throws {
             referenceFrames.append((status.pose, frame.k, depth))
         }
         if tracing {
-            print(String(format: "  t=%.3f %@ rot=%.1f rmse=%.2fmm %@", frame.time - frames[0].time,
-                         status.isTracking ? "ok  " : "LOST", status.rotationDegrees, status.rmse * 1000, status.failureReason ?? ""))
+            print(String(format: "  t=%.3f %@ rot=%.1f rmse=%.2fmm cover=%.0f%% %@", frame.time - frames[0].time,
+                         status.isTracking ? "ok  " : "LOST", status.rotationDegrees, status.rmse * 1000,
+                         status.coverage * 100, status.failureReason ?? ""))
         }
+        if status.isTracking && status.coverage > 0 { coverages.append(status.coverage) }
     }
     if let last {
         print(String(format: "  replayed here: fed %d frames, lost %d, rotation %.1f°%@", fed, last.framesLost,
                      last.rotationDegrees, onlyDeviceFrames ? " (phone's frames only)" : " (every frame)"))
     }
     printReasons(reasons)
+    let c = coverages.sorted()
+    if !c.isEmpty {
+        print(String(format: "  coverage: min %.0f%%, 1%% %.0f%%, median %.0f%%", c[0] * 100, c[c.count / 100] * 100,
+                     c[c.count / 2] * 100))
+    }
     printStages(stageLines, label: "this Mac")
     if let region = tracker.detectedHead.region, let k = frames.first?.k {
         // World space is the first camera's, so this is the head's position in the first image.

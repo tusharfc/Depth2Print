@@ -83,11 +83,15 @@ kernel void integrateVolume(device half2 *volume        [[buffer(0)]],
     float weight = 1.0;
     if (d < 0.0) {
         float surface = -d;
+        bool beyondRange = surface >= p.maxDepth - 1e-4;
         if (pc.z < surface - p.truncation) {
             tsdf = 1.0;
+            // A masked surface right behind the subject (a wall behind a head) would otherwise erode its silhouette.
+            // Rays past the range keep full weight: they are what clears stray noise out of the model.
+            weight = beyondRange ? 1.0 : kMinWeight;
         } else {
             // Beyond-range pixels say nothing about what lies past maxDepth.
-            if (pc.z > surface + p.truncation && surface < p.maxDepth - 1e-4) vote(volume, idx, old, -kVote);
+            if (pc.z > surface + p.truncation && !beyondRange) vote(volume, idx, old, -kVote);
             return;
         }
     } else {

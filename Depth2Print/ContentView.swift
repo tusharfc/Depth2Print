@@ -143,7 +143,7 @@ private extension ScanMode {
         switch self {
         case .turntable: return "Turn the turntable slowly, one full turn."
         case .handheld: return "Walk the phone slowly around the object, 20–60 cm away."
-        case .face: return "Hold the phone still. Slowly turn your head left, then right, then tilt your chin up, then down. Keep a neutral face."
+        case .face: return "Hold the phone still. Slowly turn your head left, then right, until each ear faces the phone, then tilt your chin up, then down. Keep a neutral face."
         case .body: return "Stand still while someone slowly circles you with the phone, 50–120 cm away."
         }
     }

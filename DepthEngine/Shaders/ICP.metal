@@ -8,12 +8,11 @@ struct Intrinsics {
 
 struct DepthFilterParams {
     Intrinsics k;
-    float4 plane;       // camera space (n, d): points with n·p + d < planeMargin are masked; n == 0 disables
+    float4 planes[4];   // camera space (n, d): points with n·p + d < 0 are masked; n == 0 disables
     float4 region;      // camera space sphere (center, radius): points outside are masked; radius <= 0 disables
     float minDepth, maxDepth;
     float sigmaSpace;   // pixels
     float sigmaDepth;   // meters
-    float planeMargin;
 };
 
 struct DownsampleParams {
@@ -64,7 +63,9 @@ kernel void bilateralDepth(texture2d<float, access::read> depth [[texture(0)]],
     if (zc <= p.minDepth) { out[idx] = raw[idx] = 0.0; return; }
     if (zc >= p.maxDepth) { out[idx] = raw[idx] = -p.maxDepth; return; }
     float3 pc = unproject(gid, zc, p.k);
-    bool belowPlane = any(p.plane.xyz != 0.0) && dot(p.plane.xyz, pc) + p.plane.w < p.planeMargin;
+    bool belowPlane = false;
+    for (int i = 0; i < 4; i++)
+        belowPlane = belowPlane || (any(p.planes[i].xyz != 0.0) && dot(p.planes[i].xyz, pc) + p.planes[i].w < 0.0);
     bool outsideRegion = p.region.w > 0.0 && distance(pc, p.region.xyz) > p.region.w;
     if (belowPlane || outsideRegion) { out[idx] = raw[idx] = -zc; return; }
     // Fusion averages many frames itself; smoothing here would only blur fine detail like a nose's edges.
@@ -142,7 +143,7 @@ kernel void vertexNormalMap(device const float *depth   [[buffer(0)]],
 }
 
 constant constexpr uint kICPThreads = 128;   // threadgroup is 16x8
-constant constexpr uint kICPTerms = 29;      // 21 upper JᵀJ + 6 Jᵀr + r² + inlier count
+constant constexpr uint kICPTerms = 30;      // 21 upper JᵀJ + 6 Jᵀr + r² + inlier count + usable source points
 
 // Point-to-plane ICP with projective association. Each thread handles a 2x2 pixel block (accumulating in registers,
 // which keeps the expensive threadgroup reduction to a quarter), then each threadgroup writes its partial sums of
@@ -176,7 +177,10 @@ kernel void icpReduce(device const float4 *srcVertices [[buffer(0)]],
         float4 nr = refNormals[j];
         float3 qr = refVertices[j].xyz;
         float3 nsr = (p.transform * float4(ns.xyz, 0.0)).xyz;
-        if (nr.w <= 0.0 || distance(ps, qr) >= p.maxDistance || dot(nsr, nr.xyz) <= p.minNormalDot) continue;
+        if (nr.w <= 0.0) continue;
+        // Lands where the model has surface: a good alignment should match nearly all of these.
+        acc[29] += 1.0;
+        if (distance(ps, qr) >= p.maxDistance || dot(nsr, nr.xyz) <= p.minNormalDot) continue;
 
         // J = [p × n, n], r = n · (p - q)
         float3 c = cross(ps, nr.xyz);

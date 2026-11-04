@@ -19,6 +19,8 @@ struct ScanProfile {
     /// Also hide that surface from tracking. Only right when the camera is static (turntable).
     var masksSupportPlane = false
     var locksTurntableAxis = false
+    /// The phone doesn't move (tripod, or a selfie while the head turns), so the room stays put in camera space.
+    var cameraStaysStill = false
     /// Keep only the head: a sphere found from the crown down, plus a cut below the chin.
     var isolatesHead = false
     /// Cut flat (perpendicular to gravity) where the camera's view ended, so a bust stands on its base.
@@ -32,6 +34,7 @@ struct ScanProfile {
             findsSupportPlane = true
             masksSupportPlane = true
             locksTurntableAxis = true
+            cameraStaysStill = true
         case .handheld:
             // Hand motion is jerkier and frames get dropped, so allow larger jumps between frames.
             icp.depthRange = 0.1...0.8
@@ -49,6 +52,7 @@ struct ScanProfile {
             volume.size = 0.30
             volume.resolution = 320
             isolatesHead = true
+            cameraStaysStill = true
         case .body:
             icp.depthRange = 0.3...1.5
             icp.maxDistance = [0.03, 0.045, 0.06]
