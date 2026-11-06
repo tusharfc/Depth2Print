@@ -15,7 +15,7 @@ Everything runs on the phone's GPU in real time: no cloud upload, no account, no
 ## Features
 
 - **Four scan modes**
-  - **Face**: hold the phone still and turn your head. Neck and shoulders are cut away automatically and the result is a flat-backed relief, ready to print.
+  - **Face**: hold the phone and turn your head at a natural pace, Face ID-style, sitting, reclining or lying down. ARKit face tracking follows your head, the neck and shoulders are cut away automatically, and the result is a flat-backed relief with ears, ready to print.
   - **Turntable**: the phone stays still and the object turns. The turntable surface is detected and removed, and the base is closed flat.
   - **Handheld**: walk the phone around an object resting on a table.
   - **Body**: someone walks around you to capture a bust or full body.
@@ -42,7 +42,7 @@ On synthetic scenes the engine reconstructs faces to 0.04 mm median and objects 
 
 ```mermaid
 flowchart LR
-    A[TrueDepth depth<br/>640x480 + colour + gravity] --> B[Masking<br/>table plane / head region]
+    A[TrueDepth depth<br/>640x480 + colour + gravity<br/>+ ARKit head pose in face mode] --> B[Masking<br/>table plane / walls / head region]
     B --> C[ICP against the model<br/>point-to-plane, 3 levels]
     C --> D[TSDF fusion<br/>view-angle weighted]
     D -->|raycast| C
@@ -51,9 +51,9 @@ flowchart LR
     F --> G[STL / OBJ in mm]
 ```
 
-1. **Depth capture.** The front TrueDepth camera delivers 640×480 depth, colour and device gravity. Apple's temporal filter is turned off because fusion does a better job of averaging.
-2. **Masking.** In turntable mode the support plane is found with RANSAC and removed. In face mode the head is located from gravity and the top of the head, and everything below the neck is cut away.
-3. **Tracking.** Each frame is aligned to a raycast of the fused model, not just to the previous frame, using coarse-to-fine projective point-to-plane ICP. The solver is degeneracy-aware and uses a smoothed velocity prior. On a turntable, the rotation axis is fitted and then locked.
+1. **Depth capture.** The front TrueDepth camera delivers 640×480 depth, colour and device gravity. Apple's temporal filter is turned off because fusion does a better job of averaging. In face mode the camera runs under ARKit face tracking, which adds the head's pose to every depth frame.
+2. **Masking.** Walls and other large flat surfaces behind the subject are detected and ignored. In turntable mode the support plane is found with RANSAC and removed. In face mode the head region, a cut 3 cm under the chin and the relief's flat back are all placed relative to ARKit's tracked face, so posture and framing don't matter.
+3. **Tracking.** Each frame is aligned to a raycast of the fused model, not just to the previous frame, using coarse-to-fine projective point-to-plane ICP. The solver is degeneracy-aware. In face mode it starts from ARKit's measured head motion, so quick turns are fine; elsewhere it uses a smoothed velocity prior, and on a turntable the rotation axis is fitted and then locked. Alignments that land implausibly far from where they started are rejected rather than fused.
 4. **Fusion.** The aligned depth is fused into a truncated signed distance field (TSDF). Each voxel is stored as two 16-bit floats, at up to 320³ voxels, about 0.94 mm each for faces. Measurements are weighted by how squarely the camera faced the surface. Space never seen is filled from inside/outside votes, so meshes always close.
 5. **Meshing.** GPU Marching Cubes uses lookup tables generated in code with manifold-safe triangulation. Cut planes and a cap make the result watertight, and only the largest connected piece is kept.
 6. **Colour.** Up to 80 sharp colour keyframes are kept during the scan. Each vertex takes its colour from the views that saw it most squarely, with occluded views and silhouette edges rejected.
@@ -77,7 +77,8 @@ flowchart LR
 
 - **Light:** use even, soft light. Avoid direct sunlight; its infrared swamps the TrueDepth projector.
 - **Distance:** face scans work best at 15–30 cm, objects at 20–60 cm.
-- **Speed:** move slowly. If you see "Tracking lost", go back to where tracking was last good.
+- **Speed:** face scans can go at a natural pace (look for "Face tracking on" before you start). For objects and bodies, move slowly; if you see "Tracking lost", go back to where tracking was last good.
+- **Face scans:** turn until each ear faces the phone, then tilt your chin up and down, following the voice prompts.
 - **Difficult surfaces:** shiny, black, or transparent surfaces return little depth. Glasses and very fine hair blur.
 - **File format:** export **OBJ** to keep colour, or **STL** for the smallest print-only file.
 
@@ -98,7 +99,7 @@ To record a capture, turn on **Record raw capture** in the app, scan, then use *
 ```
 Depth2Print/          SwiftUI app: camera preview, scan flow, 3D viewer, export
 DepthEngine/          Framework, no UI dependencies
-  Capture/            TrueDepth session, gravity, raw capture recorder
+  Capture/            TrueDepth session, ARKit face tracking, gravity, raw capture recorder
   Registration/       ICP, frame-to-model tracker
   Fusion/             TSDF volume, Marching Cubes, scene setup, colouring, live preview
   Export/             Mesh, STL/OBJ writer
