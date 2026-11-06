@@ -22,6 +22,8 @@ public struct TrackingStatus {
     public let rmse: Float
     /// Share of the frame's points that landed on the model in the last alignment (0...1).
     public let coverage: Float
+    /// Face mode: whether ARKit's face tracking is guiding the scan (quick turns are fine then).
+    public let followsFace: Bool
     /// Why the latest frame couldn't be aligned (nil while tracking).
     public let failureReason: String?
     /// Time the phone spent on this frame. Frames arriving meanwhile are skipped, so this sets the tracking rate.
@@ -81,6 +83,27 @@ final class FrameTracker: @unchecked Sendable {
     /// Face mode: camera-space plane 6 cm behind the head's center; the phone stays put, so this hides whatever the
     /// head rests against while keeping the face, cheeks and ears (all in front of it from the phone's side).
     private var headRest: Plane?
+    /// Face mode: the face tracker's head pose at the last tracked frame.
+    private var lastHead: HeadPose?
+    private(set) var ignoresHeadPose = false
+
+    /// Whether the depth map has a surface within 3 cm of where the pose puts the nose tip.
+    private static func agrees(_ head: HeadPose, with level: FramePyramid.Level) -> Bool {
+        let tip = head.transform * SIMD4(head.noseTip, 1)
+        let k = level.intrinsics
+        guard tip.z > 0.05 else { return false }
+        let u = Int((k.fx * tip.x / tip.z + k.cx).rounded()), v = Int((k.fy * tip.y / tip.z + k.cy).rounded())
+        let depth = level.depth.contents().bindMemory(to: Float.self, capacity: level.width * level.height)
+        for dv in -3...3 {
+            for du in -3...3 {
+                let x = u + du, y = v + dv
+                guard x >= 0, y >= 0, x < level.width, y < level.height else { continue }
+                let z = depth[y * level.width + x]
+                if z > 0 && abs(z - tip.z) < 0.03 { return true }
+            }
+        }
+        return false
+    }
     private var tilt: Float = 0
     private struct View { var origin: SIMD3<Float>; var edges: [SIMD3<Float>] }
     private var views: [View] = []
@@ -134,13 +157,14 @@ final class FrameTracker: @unchecked Sendable {
             let gravity = deviceFromCamera.flatMap { m in frame.gravity.map { m.transpose * $0 } }
             let color = frame.color.map { buffer in { VertexColorizer.rgb(buffer, width: $0, height: $1) } }
             return try track(depth: texture, intrinsics: CameraIntrinsics(frame.intrinsics), time: frame.timestamp.seconds,
-                             gravity: gravity, color: color)
+                             gravity: gravity, color: color, head: frame.head)
         }
     }
 
-    /// `gravity` is in this frame's camera space; `color` gives the matching colour image if there is one.
+    /// `gravity` is in this frame's camera space; `color` gives the matching colour image if there is one; `head`
+    /// is the face tracker's head pose for this frame (face mode).
     func track(depth: MTLTexture, intrinsics: CameraIntrinsics, time: Double,
-               gravity: SIMD3<Float>? = nil, color: ColorSampler? = nil) throws -> TrackingStatus {
+               gravity: SIMD3<Float>? = nil, color: ColorSampler? = nil, head: HeadPose? = nil) throws -> TrackingStatus {
         processingStarted = ProcessInfo.processInfo.systemUptime
         stages.removeAll()
         failure = nil
@@ -152,12 +176,25 @@ final class FrameTracker: @unchecked Sendable {
         }
         let source = current!, model = model!
         guard let volume else {
-            return try start(source, model, depth: depth, intrinsics: intrinsics, time: time, gravity: gravity, color: color)
+            var head = profile.isolatesHead ? head : nil
+            if let pose = head, !Self.agrees(pose, with: source.levels[0]) {
+                // A pose that doesn't sit on the measured face would mislead every frame; scan without it.
+                ignoresHeadPose = true
+                head = nil
+            }
+            let status = try start(source, model, depth: depth, intrinsics: intrinsics, time: time, gravity: gravity,
+                                   color: color, head: head)
+            if status.isTracking { lastHead = head }
+            return status
         }
+        let head = ignoresHeadPose ? nil : head
 
         let dt = Float(time - lastTrackedTime)
         let axis = turntableAxis.map(referenceSpace)
-        let guess = axis.map { $0.rotation(by: dot(angularVelocity, $0.direction) * dt) }
+        // The face tracker knows how the head moved since the last tracked frame, however fast or abrupt.
+        let headMotion = profile.isolatesHead ? head.flatMap { h in lastHead.map { $0.transform * h.transform.inverse } } : nil
+        let guess = headMotion
+            ?? axis.map { $0.rotation(by: dot(angularVelocity, $0.direction) * dt) }
             ?? ICP.rigid(rotation: angularVelocity * dt, translation: linearVelocity * dt)
         try timed("depth") { try icp.build(source, depth: depth, intrinsics: intrinsics, mask: mask(cameraToWorld: pose * guess)) }
         if !modelIsCurrent { try render(volume, into: model, intrinsics: intrinsics) }
@@ -181,6 +218,8 @@ final class FrameTracker: @unchecked Sendable {
             }
             if let fromGuess = plausible(try icp.align(source: source, reference: model, initial: guess, axis: axis),
                                          from: guess) { return fromGuess }
+            // With a head pose the guess is already right; the last pose is only a fallback for blind tracking.
+            guard headMotion == nil else { return nil }
             // Retry from the last good pose: that is how tracking recovers once the user moves back there.
             return plausible(try icp.align(source: source, reference: model, initial: matrix_identity_float4x4, axis: axis),
                              from: matrix_identity_float4x4)
@@ -209,6 +248,8 @@ final class FrameTracker: @unchecked Sendable {
             if length(across) > 0.3 { tilt += dot(turn, normalize(across)) }
         }
         pose = Self.orthonormalized(pose * motion)
+        // The next frame's head motion is measured from this one; without a pose here, it can't be.
+        lastHead = head
         try fuse(source, into: volume, model: model, intrinsics: intrinsics, time: time)
         record(gravity: gravity, intrinsics: intrinsics, width: depth.width, height: depth.height)
         if let color { colorizer.offer(cameraToWorld: pose, level: source.levels[1], speed: length(angularVelocity), color: color) }
@@ -264,6 +305,12 @@ final class FrameTracker: @unchecked Sendable {
     var isAxisLocked: Bool { turntableAxis != nil }
     /// Tests turn this off to track frames against the model without adding them to it.
     var fusesFrames = true
+    /// The last frame's masked depth at half resolution (what tracking used), for inspection.
+    var lastMaskedDepth: (width: Int, height: Int, depth: [Float])? {
+        guard let level = current?.levels[1] else { return nil }
+        let values = level.depth.contents().bindMemory(to: Float.self, capacity: level.width * level.height)
+        return (level.width, level.height, Array(UnsafeBufferPointer(start: values, count: level.width * level.height)))
+    }
 
     /// World "up", once gravity has been seen.
     var up: SIMD3<Float>? { length(upSum) > 0 ? normalize(upSum) : nil }
@@ -334,7 +381,7 @@ final class FrameTracker: @unchecked Sendable {
     }
 
     private func start(_ source: FramePyramid, _ model: FramePyramid, depth: MTLTexture, intrinsics: CameraIntrinsics,
-                       time: Double, gravity: SIMD3<Float>?, color: ColorSampler?) throws -> TrackingStatus {
+                       time: Double, gravity: SIMD3<Float>?, color: ColorSampler?, head: HeadPose?) throws -> TrackingStatus {
         try icp.build(source, depth: depth, intrinsics: intrinsics)
         var points = SceneSetup.points(source.levels[1])
         let upHere = gravity.flatMap { length($0) > 0.5 ? normalize(-$0) : nil }
@@ -346,7 +393,9 @@ final class FrameTracker: @unchecked Sendable {
         backgroundPlanes = Array(SceneSetup.backgroundPlanes(points, excluding: supportPlane).prefix(2))
         // A wall right behind the subject must not be mistaken for the top of a head or pull the volume toward it.
         points = points.filter { p in backgroundPlanes.allSatisfy { $0.distance(p) > Self.backgroundMargin } }
-        if profile.isolatesHead, var head = SceneSetup.head(points, up: headUp) {
+        if let head {
+            setUpHead(head)
+        } else if profile.isolatesHead, var head = SceneSetup.head(points, up: headUp) {
             // Whatever the head rests against (pillow, headrest) stays still while it turns; hide it, then look again.
             let resting = Self.behindHead(head.region)
             let front = points.filter { dot(resting.normal, $0) + resting.offset > 0 }
@@ -364,8 +413,8 @@ final class FrameTracker: @unchecked Sendable {
             return status(isTracking: false, rmse: 0)
         }
         // A few mm above the support plane so table noise doesn't leave a film under the object.
-        cutPlane = supportPlane.map { Plane(normal: $0.normal, offset: $0.offset - 0.003) }
-        if headRegion != nil {
+        if head == nil { cutPlane = supportPlane.map { Plane(normal: $0.normal, offset: $0.offset - 0.003) } }
+        if headRegion != nil && head == nil {
             // The back of the head is never seen; keep a flat-backed relief, deep enough to include the ears.
             cutPlane = Plane(normal: SIMD3(0, 0, -1), offset: center.z + 0.06)
         }
@@ -408,6 +457,24 @@ final class FrameTracker: @unchecked Sendable {
     private static func behindHead(_ region: SIMD4<Float>) -> Plane {
         let center = SIMD3(region.x, region.y, region.z)
         return Plane(normal: -normalize(center), offset: length(center) + 0.06)
+    }
+
+    /// Face mode from the tracked face (world space is this first camera's): everything relative to the head itself,
+    /// so posture, framing and what the head rests on don't matter.
+    private func setUpHead(_ head: HeadPose) {
+        let m = head.transform
+        func point(_ p: SIMD3<Float>) -> SIMD3<Float> { let w = m * SIMD4(p, 1); return SIMD3(w.x, w.y, w.z) }
+        func direction(_ v: SIMD3<Float>) -> SIMD3<Float> { let w = m * SIMD4(v, 0); return normalize(SIMD3(w.x, w.y, w.z)) }
+        let up = direction(SIMD3(0, 1, 0)), forward = direction(SIMD3(0, 0, 1))
+        let center = point(head.center)
+        headUp = up
+        headRegion = SIMD4(center, 0.17)
+        headRest = Self.behindHead(SIMD4(center, 0))
+        // 3 cm under the chin: the throat stays, the collar and chest (which don't turn with the head) go.
+        let chin = point(head.chin)
+        neckPlane = Plane(normal: up, offset: -dot(up, chin - up * 0.03))
+        // The back of the head is never seen; keep a flat-backed relief facing the way the face does, ears included.
+        cutPlane = Plane(normal: forward, offset: -dot(forward, center - forward * 0.06))
     }
 
     /// A world plane in the camera's space: n_c = Rᵀ n_w, d_c = n_w · t + d_w.
@@ -492,7 +559,8 @@ final class FrameTracker: @unchecked Sendable {
         TrackingStatus(pose: pose, rotationDegrees: length(netRotation) * 180 / .pi, headingDegrees: heading * 180 / .pi,
                        tiltDegrees: tilt * 180 / .pi,
                        degreesPerSecond: length(angularVelocity) * 180 / .pi, isTracking: isTracking,
-                       framesTracked: tracked, framesLost: lost, rmse: rmse, coverage: coverage, failureReason: failure,
+                       framesTracked: tracked, framesLost: lost, rmse: rmse, coverage: coverage,
+                       followsFace: lastHead != nil, failureReason: failure,
                        processingMilliseconds: (ProcessInfo.processInfo.systemUptime - processingStarted) * 1000,
                        stageTimings: stages.map { String(format: "%@ %.0f", $0.name, $0.ms) }.joined(separator: " · "),
                        preview: preview)

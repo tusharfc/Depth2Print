@@ -6,7 +6,7 @@ import simd
 public struct DepthFrame {
     /// kCVPixelFormatType_DepthFloat16, meters. Invalid pixels are NaN or 0.
     public let depth: CVPixelBuffer
-    /// kCVPixelFormatType_32BGRA, aligned to `depth`. Nil if the color frame was dropped.
+    /// BGRA, or full-range YCbCr 4:2:0 (ARKit); registered to `depth` (same field of view).
     public let color: CVPixelBuffer?
     /// Pinhole intrinsics scaled to the depth map's resolution (column-major: fx=[0][0], fy=[1][1], cx=[2][0], cy=[2][1]).
     public let intrinsics: simd_float3x3
@@ -14,11 +14,14 @@ public struct DepthFrame {
     public let timestamp: CMTime
     /// Gravity in CoreMotion device axes (x right, y toward the top edge, z out of the screen), in g.
     public let gravity: SIMD3<Float>?
+    /// The face tracker's head pose (face mode with ARKit), nil otherwise.
+    public let head: HeadPose?
 }
 
+/// Receives frames from either capture source.
 public protocol TrueDepthCaptureDelegate: AnyObject {
-    /// Called on the capture data queue. Return immediately and don't hold more than ~2 frames.
-    func captureManager(_ manager: TrueDepthCaptureManager, didOutput frame: DepthFrame)
+    /// Called on a capture queue. Return immediately and don't hold more than ~2 frames.
+    func captureDidOutput(_ frame: DepthFrame)
 }
 
 // State is only touched on sessionQueue (configuration) or dataQueue (delivery).
@@ -83,6 +86,17 @@ public final class TrueDepthCaptureManager: NSObject, @unchecked Sendable {
         sessionQueue.async {
             if self.session.isRunning { self.session.stopRunning() }
             self.motion.stopDeviceMotionUpdates()
+        }
+    }
+
+    /// Stops and returns once the camera is released (another session can then take it).
+    func stopAndWait() async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            sessionQueue.async {
+                if self.session.isRunning { self.session.stopRunning() }
+                self.motion.stopDeviceMotionUpdates()
+                cont.resume()
+            }
         }
     }
 
@@ -235,8 +249,8 @@ public final class TrueDepthCaptureManager: NSObject, @unchecked Sendable {
         }
     }
 
-    private static func scaledIntrinsics(_ calibration: AVCameraCalibrationData,
-                                         to depthMap: CVPixelBuffer) -> simd_float3x3 {
+    static func scaledIntrinsics(_ calibration: AVCameraCalibrationData,
+                                 to depthMap: CVPixelBuffer) -> simd_float3x3 {
         var k = calibration.intrinsicMatrix
         let ref = calibration.intrinsicMatrixReferenceDimensions
         let sx = Float(CVPixelBufferGetWidth(depthMap)) / Float(ref.width)
@@ -265,13 +279,14 @@ extension TrueDepthCaptureManager: AVCaptureDataOutputSynchronizerDelegate {
         }
 
         let gravity = motion.deviceMotion.map { SIMD3(Float($0.gravity.x), Float($0.gravity.y), Float($0.gravity.z)) }
-        delegate?.captureManager(self, didOutput: DepthFrame(
+        delegate?.captureDidOutput(DepthFrame(
             depth: depthMap,
             color: color,
             intrinsics: Self.scaledIntrinsics(calibration, to: depthMap),
             calibration: calibration,
             timestamp: syncedDepth.timestamp,
-            gravity: gravity
+            gravity: gravity,
+            head: nil
         ))
     }
 }

@@ -17,7 +17,15 @@ final class ScanModel: ObservableObject {
     @Published private(set) var tracking: TrackingStatus?
     @Published private(set) var preview: CGImage?
     @Published var format: MeshExportFormat = .stl
-    @Published var mode: ScanMode = .turntable
+    @Published var mode: ScanMode = .turntable {
+        didSet {
+            // Face mode runs on ARKit face tracking, the other modes on the plain TrueDepth camera.
+            guard phase == .ready, (mode == .face) != (oldValue == .face) else { return }
+            Task { await startPreview() }
+        }
+    }
+    /// The camera feed is ARKit face tracking (show `scanner.faceSession`) rather than `scanner.captureSession`.
+    @Published private(set) var usesFaceTracking = false
     @Published var cuesEnabled = true
     @Published var recordsCapture = false
     /// Zipped raw capture of the last scan, for replaying it on a Mac (Tools/ScanBench).
@@ -52,7 +60,8 @@ final class ScanModel: ObservableObject {
     func startPreview() async {
         phase = .starting
         do {
-            try await scanner.startPreview()
+            try await scanner.startPreview(mode: mode)
+            usesFaceTracking = scanner.usesFaceTracking
             phase = .ready
         } catch {
             phase = .failed(error.localizedDescription)

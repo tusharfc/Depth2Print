@@ -14,21 +14,31 @@ func replay(_ directory: URL) throws {
         return simd_float3x3(SIMD3(f[0], f[1], f[2]), SIMD3(f[3], f[4], f[5]), SIMD3(f[6], f[7], f[8]))
     }
 
-    struct Frame { var time: Double; var k: CameraIntrinsics; var gravity: SIMD3<Float>?; var depth: Data }
+    struct Frame { var time: Double; var k: CameraIntrinsics; var gravity: SIMD3<Float>?; var head: HeadPose?; var depth: Data }
     let blob = try Data(contentsOf: directory.appendingPathComponent("frames.bin"))
+    // Version 2 adds the face tracker's head pose (22 floats) before the byte count.
+    let headFloats = (header["version"] as? Int ?? 1) >= 2 ? 22 : 0
+    let fixed = 36 + headFloats * 4 + 4
     var frames: [Frame] = []
     var offset = 0
     blob.withUnsafeBytes { bytes in
         func float(_ at: Int) -> Float { Float(bitPattern: UInt32(littleEndian: bytes.loadUnaligned(fromByteOffset: at, as: UInt32.self))) }
-        while offset + 40 <= bytes.count {
+        while offset + fixed <= bytes.count {
             let time = Double(bitPattern: UInt64(littleEndian: bytes.loadUnaligned(fromByteOffset: offset, as: UInt64.self)))
             let k = CameraIntrinsics(fx: float(offset + 8), fy: float(offset + 12), cx: float(offset + 16), cy: float(offset + 20))
             let g = SIMD3(float(offset + 24), float(offset + 28), float(offset + 32))
-            let count = Int(UInt32(littleEndian: bytes.loadUnaligned(fromByteOffset: offset + 36, as: UInt32.self)))
-            guard offset + 40 + count <= bytes.count else { break }
-            frames.append(Frame(time: time, k: k, gravity: g.x.isNaN ? nil : g,
-                                depth: Data(bytes[(offset + 40)..<(offset + 40 + count)])))
-            offset += 40 + count
+            var head: HeadPose?
+            if headFloats > 0, !float(offset + 36).isNaN {
+                let v = (0..<22).map { float(offset + 36 + $0 * 4) }
+                let m = simd_float4x4(SIMD4(v[0], v[1], v[2], v[3]), SIMD4(v[4], v[5], v[6], v[7]),
+                                      SIMD4(v[8], v[9], v[10], v[11]), SIMD4(v[12], v[13], v[14], v[15]))
+                head = HeadPose(transform: m, chin: SIMD3(v[16], v[17], v[18]), noseTip: SIMD3(v[19], v[20], v[21]))
+            }
+            let count = Int(UInt32(littleEndian: bytes.loadUnaligned(fromByteOffset: offset + fixed - 4, as: UInt32.self)))
+            guard offset + fixed + count <= bytes.count else { break }
+            frames.append(Frame(time: time, k: k, gravity: g.x.isNaN ? nil : g, head: head,
+                                depth: Data(bytes[(offset + fixed)..<(offset + fixed + count)])))
+            offset += fixed + count
         }
     }
 
@@ -79,6 +89,18 @@ func replay(_ directory: URL) throws {
             tracker.fusesFrames = !(holdout[0]..<(holdout[0] + holdout[1])).contains(index)
         }
         guard var raw = try? (frame.depth as NSData).decompressed(using: .lzfse) as Data else { continue }
+        if environment["NOSE"] != nil, index % 10 == 0 {
+            // Nearest valid point (the nose tip when the face is closest): where it is in the image and how near.
+            let depth: [Float] = raw.withUnsafeBytes { Array($0.bindMemory(to: Float16.self)).map(Float.init) }
+            var best = (z: Float.infinity, x: 0, y: 0)
+            for y in stride(from: height / 8, to: height * 7 / 8, by: 2) {
+                for x in stride(from: width / 8, to: width * 7 / 8, by: 2) {
+                    let z = depth[y * width + x]
+                    if z.isFinite && z > 0.1 && z < best.z { best = (z, x, y) }
+                }
+            }
+            print(String(format: "  nose t=%5.2f px (%3d, %3d) z %.0f mm", frame.time - frames[0].time, best.x, best.y, best.z * 1000))
+        }
         if let k = environment["DISTORTION"].flatMap(Float.init) {
             raw = undistort(raw, width: width, height: height, center: SIMD2(frame.k.cx, frame.k.cy), strength: k)
         }
@@ -87,9 +109,11 @@ func replay(_ directory: URL) throws {
         raw.withUnsafeBytes { texture.replace(region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0,
                                               withBytes: $0.baseAddress!, bytesPerRow: width * 2) }
         let gravity = deviceFromCamera.flatMap { m in frame.gravity.map { m.transpose * $0 } }
-        let status = try tracker.track(depth: texture, intrinsics: frame.k, time: frame.time, gravity: gravity)
+        let status = try tracker.track(depth: texture, intrinsics: frame.k, time: frame.time, gravity: gravity,
+                                       head: environment["HEADPOSE"] == "0" ? nil : frame.head)
         fed += 1
         last = status
+        if status.isTracking && status.coverage > 0 { coverages.append(status.coverage) }
         if let reason = status.failureReason { reasons.append(reason) }
         stageLines.append(status.stageTimings)
         if environment["CONSISTENCY"] != nil, status.isTracking, fed % 15 == 0 {
@@ -105,11 +129,28 @@ func replay(_ directory: URL) throws {
                          status.isTracking ? "ok  " : "LOST", status.rotationDegrees, status.rmse * 1000,
                          status.coverage * 100, status.failureReason ?? ""))
         }
-        if status.isTracking && status.coverage > 0 { coverages.append(status.coverage) }
+        if environment["SHOWMASK"]?.split(separator: ",").compactMap({ Int($0) }).contains(index) == true,
+           let masked = tracker.lastMaskedDepth {
+            // Kept depth in cm (0-9 = 10-19 cm, a-z = 20-45 cm), '.' = masked or no data.
+            print("  frame \(index) masked depth (\(status.isTracking ? "tracked" : "lost")):")
+            let ramp = Array("0123456789abcdefghijklmnopqrstuvwxyz")
+            for y in stride(from: 0, to: masked.height, by: 8) {
+                var line = "    "
+                for x in stride(from: 0, to: masked.width, by: 4) {
+                    let z = masked.depth[y * masked.width + x]
+                    let i = Int((z * 100).rounded()) - 10
+                    line.append(z > 0 && i >= 0 && i < ramp.count ? ramp[i] : (z > 0 ? "+" : "."))
+                }
+                print(line)
+            }
+        }
     }
     if let last {
         print(String(format: "  replayed here: fed %d frames, lost %d, rotation %.1f°%@", fed, last.framesLost,
                      last.rotationDegrees, onlyDeviceFrames ? " (phone's frames only)" : " (every frame)"))
+        let withHead = frames.filter { $0.head != nil }.count
+        print("  face tracking: \(withHead) of \(frames.count) frames have a head pose"
+              + (tracker.ignoresHeadPose ? "; IGNORED (pose disagreed with depth on the first frame)" : ""))
     }
     printReasons(reasons)
     let c = coverages.sorted()
@@ -123,6 +164,15 @@ func replay(_ directory: URL) throws {
         print(String(format: "  head region: pixel (%.0f, %.0f) of %dx%d, %.0f mm away, radius %.0f mm",
                      k.fx * region.x / region.z + k.cx, k.fy * region.y / region.z + k.cy, width, height,
                      region.z * 1000, region.w * 1000))
+        if let neck = tracker.detectedHead.neck {
+            let n = neck.normal
+            print(String(format: "  neck cut: normal (%.2f, %.2f, %.2f) in camera space, %.0f mm from the head center",
+                         n.x, n.y, n.z, neck.distance(SIMD3(region.x, region.y, region.z)) * 1000))
+        }
+        for plane in tracker.detectedBackground {
+            print(String(format: "  background plane: normal (%.2f, %.2f, %.2f), %.0f mm from camera",
+                         plane.normal.x, plane.normal.y, plane.normal.z, plane.offset * 1000))
+        }
     }
 
     let mesh = try tracker.extractMesh()

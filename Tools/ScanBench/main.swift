@@ -18,6 +18,7 @@ struct DepthFrame {
     let intrinsics: simd_float3x3
     let timestamp: CMTime
     let gravity: SIMD3<Float>?
+    let head: HeadPose?
 }
 
 let device = MTLCreateSystemDefaultDevice()!
@@ -235,7 +236,7 @@ struct Region {
 func runScenario(_ name: String, mode: ScanMode, frames: Int, scene: (Int) -> (groups: [Group], subject: simd_float4x4),
                  truth: @escaping (SIMD3<Float>) -> Float, evaluate: @escaping (SIMD3<Float>) -> Bool = { _ in true },
                  details: [Region] = [], gravity fixedGravity: SIMD3<Float>? = nil,
-                 screenUp: SIMD3<Float>? = nil) throws {
+                 screenUp: SIMD3<Float>? = nil, face: (chin: SIMD3<Float>, noseTip: SIMD3<Float>)? = nil) throws {
     // Device axes: x right, y the top edge, z out of the screen (toward the user, i.e. the camera's +z).
     let deviceFromCamera = screenUp.map { s in
         simd_float3x3(cross(s, SIMD3(0, 0, 1)), s, SIMD3(0, 0, 1)).transpose
@@ -262,9 +263,16 @@ func runScenario(_ name: String, mode: ScanMode, frames: Int, scene: (Int) -> (g
         let reclined = recline.map { r in SIMD3<Float>(0, cos(r), sin(r)) }
         let gravity = (fixedGravity ?? reclined ?? -SIMD3(up.x, up.y, up.z)) + SIMD3(gaussian(), gaussian(), gaussian()) * 0.01
         let start = Date()
+        // A face tracker's pose with ARKit-like jitter (~0.5°, ~1.5 mm); HEADPOSE=0 scans blind.
+        let head = face.flatMap { landmarks -> HeadPose? in
+            guard environment["HEADPOSE"] != "0" else { return nil }
+            let jitter = ICP.rigid(rotation: SIMD3(gaussian(), gaussian(), gaussian()) * 0.5 * .pi / 180,
+                                   translation: SIMD3(gaussian(), gaussian(), gaussian()) * 0.0015)
+            return HeadPose(transform: jitter * s.subject, chin: landmarks.chin, noseTip: landmarks.noseTip)
+        }
         let status = try tracker.track(depth: depthTexture(depth, width: W, height: H), intrinsics: K,
                                        time: Double(k) / 30, gravity: gravity,
-                                       color: { renderColor(s.groups, width: $0, height: $1) })
+                                       color: { renderColor(s.groups, width: $0, height: $1) }, head: head)
         seconds += Date().timeIntervalSince(start)
         last = status
         if status.isTracking && status.coverage > 0 { coverages.append(status.coverage) }
@@ -412,7 +420,7 @@ func runSynthetic() throws {
             return ([Group(shapes: person, toCamera: m)], m)
         }, truth: { p in person.map { $0.sdf(p) }.min()! })
     }
-    if enabled("face") || enabled("face-low") || enabled("face-nod") || enabled("face-lying") {
+    if ["face", "face-low", "face-nod", "face-lying", "face-lying-close"].contains(where: enabled) {
         // Head turns ±60° in front of a still phone; shoulders stay put. Cheek bumps 6 mm wide and 4 mm high
         // measure how much fine detail survives.
         let bumps = [SIMD3<Float>(0.04, -0.02, 0.0745), SIMD3<Float>(-0.04, -0.02, 0.0745)]
@@ -438,10 +446,12 @@ func runSynthetic() throws {
         // the chest is in view and nearer to it than the nose (the case that used to scan the shirt).
         // "face-nod": level phone; the head turns left/right, then tilts chin up/down.
         // "face-lying": on your back, phone held above the face (face upright on screen), gravity into the bed.
+        // "face-lying-close": the same with the phone 16 cm from the nose, so the crown is out of frame.
         let setups: [(String, SIMD3<Float>, Float, Float, Float)] = [("face", SIMD3(0, 0, 0.4), 0, 0, 0.1),
                                                                     ("face-low", SIMD3(0, -0.08, 0.35), 0.15, .pi / 2, 0.15),
                                                                     ("face-nod", SIMD3(0, 0, 0.4), 0, 0, 0.1),
-                                                                    ("face-lying", SIMD3(0, 0, 0.35), 0, 0, 0.1)]
+                                                                    ("face-lying", SIMD3(0, 0, 0.35), 0, 0, 0.1),
+                                                                    ("face-lying-close", SIMD3(0, 0, 0.27), 0, 0, 0.1)]
         for (name, origin, tilt, roll, chest) in setups where enabled(name) {
             // The collar sits ~11 cm below the chin (y = -0.11).
             let torso: [Shape] = [.box(SIMD3(-0.18, -0.5, -0.1), SIMD3(0.18, -0.22, chest))]
@@ -449,25 +459,30 @@ func runSynthetic() throws {
             // Tilting the phone up rotates the scene about the camera's x axis; portrait rolls it about z.
             let headBase = ICP.rigid(rotation: SIMD3(0, 0, roll), translation: .zero)
                 * ICP.rigid(rotation: SIMD3(-tilt, 0, 0), translation: .zero) * level
-            let nods = name == "face-nod", lying = name == "face-lying"
+            let nods = name == "face-nod", lying = name.hasPrefix("face-lying")
             // A mattress just behind the head and a pillow under it that reaches past the crown.
             let bed: [Shape] = lying ? [.plane(SIMD3(0, 0, 1), 0.11), .ellipsoid(SIMD3(0, 0.03, -0.12), SIMD3(0.25, 0.16, 0.04))] : []
             let screenUp = (ICP.rigid(rotation: SIMD3(0, 0, roll), translation: .zero) * SIMD4(0, -1, 0, 0))
             let pivot = SIMD3<Float>(0, -0.1, -0.02)   // nodding turns about the upper neck
-            try runScenario(name, mode: .face, frames: nods ? 400 : 240, scene: { k in
+            // SPEED=n turns the head n times faster (same angles, n times fewer frames).
+            let speed = environment["SPEED"].flatMap(Float.init) ?? 1
+            let turnFrames = Int((240 / speed).rounded()), nodFrames = Int((160 / speed).rounded())
+            try runScenario(name, mode: .face, frames: nods ? turnFrames + nodFrames : turnFrames, scene: { k in
                 var m = headBase
-                if !nods || k < 240 {
-                    let angle = (nods ? 50 : 60) * Float.pi / 180 * sin(2 * .pi * Float(k) / 240)
+                if !nods || k < turnFrames {
+                    let angle = (nods ? 50 : 60) * Float.pi / 180 * sin(2 * .pi * Float(k) / Float(turnFrames))
                     m = m * translate(neck) * rotY(angle) * translate(-neck)
                 } else {
-                    let angle = 25 * Float.pi / 180 * sin(2 * .pi * Float(k - 240) / 160)
+                    let angle = 25 * Float.pi / 180 * sin(2 * .pi * Float(k - turnFrames) / Float(nodFrames))
                     m = m * translate(pivot) * ICP.rigid(rotation: SIMD3(angle, 0, 0), translation: .zero) * translate(-pivot)
                 }
                 return ([Group(shapes: head, toCamera: m), Group(shapes: torso + bed, toCamera: headBase)], m)
             }, truth: { p in head.map { $0.sdf(p) }.min()! },
                evaluate: { p in p.z > 0.04 && p.y > -0.06 },   // what the camera saw, not the flat back
                details: details, gravity: lying ? SIMD3(0, 0, 1) : nil,
-               screenUp: SIMD3(screenUp.x, screenUp.y, screenUp.z))
+               screenUp: SIMD3(screenUp.x, screenUp.y, screenUp.z),
+               // As a fitted face mesh reports them, a few mm off the true shape.
+               face: (chin: SIMD3(0, -0.105, 0.035), noseTip: SIMD3(0, -0.01, 0.108)))
         }
     }
 }

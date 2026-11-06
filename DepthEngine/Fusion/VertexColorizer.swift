@@ -103,9 +103,13 @@ struct VertexColorizer {
         return top * (1 - fy) + bottom * fy
     }
 
-    /// Box-filters a BGRA camera frame down to `width` × `height` RGB.
+    /// Box-filters a camera frame (BGRA, or YCbCr 4:2:0 from ARKit) down to `width` × `height` RGB.
     static func rgb(_ buffer: CVPixelBuffer, width: Int, height: Int) -> [UInt8]? {
-        guard CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA else { return nil }
+        let format = CVPixelBufferGetPixelFormatType(buffer)
+        if format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange || format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange {
+            return rgbFromYCbCr(buffer, width: width, height: height, fullRange: format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+        }
+        guard format == kCVPixelFormatType_32BGRA else { return nil }
         CVPixelBufferLockBaseAddress(buffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
         guard let base = CVPixelBufferGetBaseAddress(buffer) else { return nil }
@@ -128,6 +132,41 @@ struct VertexColorizer {
                 out[(v * width + u) * 3] = UInt8(mean.x)
                 out[(v * width + u) * 3 + 1] = UInt8(mean.y)
                 out[(v * width + u) * 3 + 2] = UInt8(mean.z)
+            }
+        }
+        return out
+    }
+
+    /// Same for bi-planar YCbCr: luma box-filtered, chroma from the block's center, BT.601 to RGB.
+    private static func rgbFromYCbCr(_ buffer: CVPixelBuffer, width: Int, height: Int, fullRange: Bool) -> [UInt8]? {
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard CVPixelBufferGetPlaneCount(buffer) == 2,
+              let lumaBase = CVPixelBufferGetBaseAddressOfPlane(buffer, 0),
+              let chromaBase = CVPixelBufferGetBaseAddressOfPlane(buffer, 1) else { return nil }
+        let luma = lumaBase.assumingMemoryBound(to: UInt8.self), chroma = chromaBase.assumingMemoryBound(to: UInt8.self)
+        let sw = CVPixelBufferGetWidthOfPlane(buffer, 0), sh = CVPixelBufferGetHeightOfPlane(buffer, 0)
+        let lumaRow = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0), chromaRow = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1)
+        var out = [UInt8](repeating: 0, count: width * height * 3)
+        for v in 0..<height {
+            let y0 = v * sh / height, y1 = max(y0 + 1, (v + 1) * sh / height)
+            for u in 0..<width {
+                let x0 = u * sw / width, x1 = max(x0 + 1, (u + 1) * sw / width)
+                var sum = 0
+                for y in y0..<y1 { for x in x0..<x1 { sum += Int(luma[y * lumaRow + x]) } }
+                var l = Float(sum) / Float((y1 - y0) * (x1 - x0))
+                let c = chroma + ((y0 + y1) / 4) * chromaRow + ((x0 + x1) / 4) * 2
+                var cb = Float(c[0]) - 128, cr = Float(c[1]) - 128
+                if !fullRange {
+                    l = (l - 16) * 255 / 219
+                    cb *= 255 / 224
+                    cr *= 255 / 224
+                }
+                let rgb = SIMD3<Float>(l + 1.402 * cr, l - 0.344136 * cb - 0.714136 * cr, l + 1.772 * cb)
+                let clamped = simd_clamp(rgb, SIMD3(repeating: 0), SIMD3(repeating: 255))
+                out[(v * width + u) * 3] = UInt8(clamped.x)
+                out[(v * width + u) * 3 + 1] = UInt8(clamped.y)
+                out[(v * width + u) * 3 + 2] = UInt8(clamped.z)
             }
         }
         return out

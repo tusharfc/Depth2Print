@@ -1,12 +1,18 @@
+import ARKit
 import AVFoundation
 import simd
 
 /// Public entry point: TrueDepth camera feed in, triangle mesh out. No UI dependencies.
 public final class DepthScanner {
-    /// Exposed so a host app can attach its own preview layer.
+    /// Exposed so a host app can attach its own preview layer (every mode but face tracking).
     public var captureSession: AVCaptureSession { capture.session }
+    /// Face mode's camera feed when `usesFaceTracking` (show it with an ARSCNView).
+    public var faceSession: ARSession { faceCapture.session }
+    /// Whether the running preview is ARKit face tracking rather than the plain TrueDepth session.
+    public private(set) var usesFaceTracking = false
 
     private let capture = TrueDepthCaptureManager()
+    private let faceCapture = FaceTrackingCaptureManager()
     private let frames = FrameRouter()
 
     /// Called on a background queue for each frame tracked during a scan.
@@ -17,14 +23,26 @@ public final class DepthScanner {
 
     public init() {
         capture.delegate = frames
+        faceCapture.delegate = frames
     }
 
-    public func startPreview() async throws {
-        try await capture.start()
+    /// Starts the camera for `mode`: ARKit face tracking for faces where the device supports it (it follows the head
+    /// through quick turns in any posture), the plain TrueDepth session otherwise. Only one can own the camera.
+    public func startPreview(mode: ScanMode = .turntable) async throws {
+        if mode == .face && FaceTrackingCaptureManager.isSupported {
+            await capture.stopAndWait()
+            try faceCapture.start()
+            usesFaceTracking = true
+        } else {
+            faceCapture.stop()
+            usesFaceTracking = false
+            try await capture.start()
+        }
     }
 
     public func stop() {
         capture.stop()
+        faceCapture.stop()
     }
 
     /// `deviceFromCamera` (see `CameraAxes`) lets gravity orient the export and pick the support surface;
@@ -33,11 +51,11 @@ public final class DepthScanner {
     public func beginScan(mode: ScanMode, deviceFromCamera: simd_float3x3? = nil, recordingTo directory: URL? = nil) throws {
         let recorder = try directory.map { try CaptureRecorder(directory: $0, mode: mode, deviceFromCamera: deviceFromCamera) }
         frames.start(try FrameTracker(mode: mode, deviceFromCamera: deviceFromCamera), recorder: recorder)
-        capture.setImagingLocked(true)
+        if !usesFaceTracking { capture.setImagingLocked(true) }
     }
 
     public func finishScan() async throws -> Mesh {
-        capture.setImagingLocked(false)
+        if !usesFaceTracking { capture.setImagingLocked(false) }
         let mesh = try await frames.finishTracking()
         guard mesh.triangleCount > 0 else { throw DepthEngineError.emptyScan }
         return mesh
@@ -82,7 +100,7 @@ private final class FrameRouter: TrueDepthCaptureDelegate {
         }
     }
 
-    func captureManager(_ manager: TrueDepthCaptureManager, didOutput frame: DepthFrame) {
+    func captureDidOutput(_ frame: DepthFrame) {
         let (tracker, recorder): (FrameTracker?, CaptureRecorder?) = lock.withLock {
             // Skip this frame if the previous one is still aligning; the velocity prior covers the gap.
             guard !trackerBusy, let tracker = self.tracker else { return (nil, self.recorder) }

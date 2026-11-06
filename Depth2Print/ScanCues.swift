@@ -44,7 +44,7 @@ final class ScanCues {
         switch mode {
         case .turntable: say("Start turning slowly.")
         case .handheld: say("Walk slowly around the object.")
-        case .face: say("Hold still, then slowly turn your head to one side.")
+        case .face: say("Turn your head to one side.")
         case .body: say("Walk slowly around the person.")
         }
     }
@@ -64,7 +64,9 @@ final class ScanCues {
         }
         wasTracking = true
 
-        if status.degreesPerSecond > maxDegreesPerSecond { say("Slow down.", key: "slow", every: 3) }
+        // Face tracking follows quick head turns; only blind tracking needs the user to go slowly.
+        let limit = status.followsFace ? 200 : maxDegreesPerSecond
+        if status.degreesPerSecond > limit { say("Slow down.", key: "slow", every: 3) }
 
         if mode == .face {
             guideFace(status)
@@ -95,16 +97,16 @@ final class ScanCues {
         case 0 where abs(heading) >= 60:
             firstSide = heading < 0 ? -1 : 1
             tick()
-            say("Now slowly turn to the other side.")
+            say("Now turn to the other side.")
             faceStage = 1
         case 1 where heading * firstSide <= -60:
             tick()
-            say("Now face the camera and slowly tilt your chin up.")
+            say("Now face the camera and tilt your chin up.")
             faceStage = 2
         case 2 where abs(status.tiltDegrees) >= 20:
             firstTilt = status.tiltDegrees < 0 ? -1 : 1
             tick()
-            say("Now slowly tilt your chin down.")
+            say("Now tilt your chin down.")
             faceStage = 3
         case 3 where status.tiltDegrees * firstTilt <= -20:
             tick()

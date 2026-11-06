@@ -7,9 +7,16 @@ struct ContentView: View {
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            CameraPreview(session: model.scanner.captureSession, overlay: model.preview,
-                          onCameraAxes: { model.cameraAxes = $0 })
-                .ignoresSafeArea()
+            Group {
+                if model.usesFaceTracking {
+                    FaceTrackingPreview(session: model.scanner.faceSession, overlay: model.preview,
+                                        onCameraAxes: { model.cameraAxes = $0 })
+                } else {
+                    CameraPreview(session: model.scanner.captureSession, overlay: model.preview,
+                                  onCameraAxes: { model.cameraAxes = $0 })
+                }
+            }
+            .ignoresSafeArea()
 
             controls
                 .frame(maxWidth: .infinity)
@@ -124,6 +131,7 @@ struct ContentView: View {
         var text = String(format: "%.0f ms/frame (≤%.0f fps) · lost %d of %d", ms, 1000 / max(ms, 1),
                           status.framesLost, status.framesTracked + status.framesLost)
         text += "\n" + status.stageTimings
+        if status.followsFace { text += " · face tracking" }
         if let reason = status.failureReason { text += "\n\(reason)" }
         return text
     }
@@ -143,7 +151,7 @@ private extension ScanMode {
         switch self {
         case .turntable: return "Turn the turntable slowly, one full turn."
         case .handheld: return "Walk the phone slowly around the object, 20–60 cm away."
-        case .face: return "Hold the phone still. Slowly turn your head left, then right, until each ear faces the phone, then tilt your chin up, then down. Keep a neutral face."
+        case .face: return "Hold the phone still. Turn your head left, then right, until each ear faces the phone, then tilt your chin up, then down. Move naturally; keep a neutral face."
         case .body: return "Stand still while someone slowly circles you with the phone, 50–120 cm away."
         }
     }

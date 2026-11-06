@@ -5,9 +5,10 @@ import simd
 
 /// Saves every depth frame of a scan, plus gravity and the tracker's per-frame verdicts, so the scan can be replayed
 /// on a Mac with Tools/ScanBench. Layout of the directory:
-///   capture.json  {"version":1, "mode", "width", "height", "deviceFromCamera": [9 floats, column-major] | null}
+///   capture.json  {"version":2, "mode", "width", "height", "deviceFromCamera": [9 floats, column-major] | null}
 ///   frames.bin    per frame, little-endian: Float64 time, Float32 fx fy cx cy, Float32 gravity xyz (device axes,
-///                 NaN if unknown), UInt32 byte count, then LZFSE-compressed Float16 depth rows (meters)
+///                 NaN if unknown), Float32 head pose: 16 transform (column-major) + chin xyz + nose tip xyz (NaN if
+///                 none; version 2 only), UInt32 byte count, then LZFSE-compressed Float16 depth rows (meters)
 ///   log.csv       time,tracking,ms,rotation,reason,stages — one line per frame the phone actually processed
 final class CaptureRecorder: @unchecked Sendable {
     let directory: URL
@@ -53,6 +54,11 @@ final class CaptureRecorder: @unchecked Sendable {
 
         let k = frame.intrinsics
         let gravity = frame.gravity ?? SIMD3(repeating: .nan)
+        let head: [Float] = frame.head.map { h in
+            let m = h.transform
+            return [m.columns.0, m.columns.1, m.columns.2, m.columns.3].flatMap { [$0.x, $0.y, $0.z, $0.w] }
+                + [h.chin.x, h.chin.y, h.chin.z, h.noseTip.x, h.noseTip.y, h.noseTip.z]
+        } ?? Array(repeating: .nan, count: 22)
         let time = frame.timestamp.seconds
         queue.async { [self] in
             defer { lock.withLock { backlog -= 1 } }
@@ -62,7 +68,7 @@ final class CaptureRecorder: @unchecked Sendable {
             guard let compressed = try? (depth as NSData).compressed(using: .lzfse) as Data else { return }
             var record = Data()
             withUnsafeBytes(of: time.bitPattern.littleEndian) { record.append(contentsOf: $0) }
-            for value in [k[0][0], k[1][1], k[2][0], k[2][1], gravity.x, gravity.y, gravity.z] {
+            for value in [k[0][0], k[1][1], k[2][0], k[2][1], gravity.x, gravity.y, gravity.z] + head {
                 withUnsafeBytes(of: value.bitPattern.littleEndian) { record.append(contentsOf: $0) }
             }
             withUnsafeBytes(of: UInt32(compressed.count).littleEndian) { record.append(contentsOf: $0) }
@@ -88,7 +94,7 @@ final class CaptureRecorder: @unchecked Sendable {
     }
 
     private func writeHeader(width: Int, height: Int) {
-        var header: [String: Any] = ["version": 1, "mode": mode.rawValue, "width": width, "height": height]
+        var header: [String: Any] = ["version": 2, "mode": mode.rawValue, "width": width, "height": height]
         if let m = deviceFromCamera {
             header["deviceFromCamera"] = [m.columns.0, m.columns.1, m.columns.2].flatMap { [$0.x, $0.y, $0.z] }
         }
