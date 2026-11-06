@@ -76,6 +76,11 @@ final class FrameTracker: @unchecked Sendable {
     /// Sum of per-frame "up" (against gravity) in world space; averaged rather than taken from one shaky sample.
     private var upSum = SIMD3<Float>(repeating: 0)
     private var heading: Float = 0
+    /// Face mode: toward the crown in world space, from the first frame.
+    private var headUp: SIMD3<Float>?
+    /// Face mode: camera-space plane 6 cm behind the head's center; the phone stays put, so this hides whatever the
+    /// head rests against while keeping the face, cheeks and ears (all in front of it from the phone's side).
+    private var headRest: Plane?
     private var tilt: Float = 0
     private struct View { var origin: SIMD3<Float>; var edges: [SIMD3<Float>] }
     private var views: [View] = []
@@ -194,7 +199,8 @@ final class FrameTracker: @unchecked Sendable {
             linearVelocity += (SIMD3(motion.columns.3.x, motion.columns.3.y, motion.columns.3.z) / dt - linearVelocity) * blend
         }
         netRotation += Self.upperLeft(pose) * rotation
-        if let up {
+        // A face turns about its own axes, whatever the posture; everything else about gravity.
+        if let up = headUp ?? up {
             let turn = Self.upperLeft(pose) * rotation
             heading += dot(turn, up)
             // The horizontal axis across the view: nodding turns about it.
@@ -262,10 +268,19 @@ final class FrameTracker: @unchecked Sendable {
     /// World "up", once gravity has been seen.
     var up: SIMD3<Float>? { length(upSum) > 0 ? normalize(upSum) : nil }
 
+    /// Toward the crown, in world space (face mode). Gravity is reliable while the person is upright, i.e. while it
+    /// agrees with the screen's top edge (the face shows upright on screen); lying down or reclining, the screen
+    /// is the better guide since gravity then points out of the face or along it.
+    private static func headUp(gravity: SIMD3<Float>?, screen: SIMD3<Float>?) -> SIMD3<Float>? {
+        guard let screen else { return gravity }
+        guard let gravity else { return screen }
+        return dot(gravity, screen) > cos(15 * Float.pi / 180) ? gravity : screen
+    }
+
     /// Cuts, the direction that becomes +Z, and a hint for +Y (the first camera's forward, or head-up for a relief).
     private func printLayout() -> (cuts: [Plane], z: SIMD3<Float>?, y: SIMD3<Float>?) {
         let forward = SIMD3<Float>(0, 0, 1)
-        if let plane = cutPlane, headRegion != nil { return ([plane] + [neckPlane].compactMap { $0 }, plane.normal, up) }
+        if let plane = cutPlane, headRegion != nil { return ([plane] + [neckPlane].compactMap { $0 }, plane.normal, headUp ?? up) }
         let back = flatBack()
         if let plane = cutPlane { return ([plane] + [back].compactMap { $0 }, plane.normal, forward) }
         if let back {
@@ -323,11 +338,20 @@ final class FrameTracker: @unchecked Sendable {
         try icp.build(source, depth: depth, intrinsics: intrinsics)
         var points = SceneSetup.points(source.levels[1])
         let upHere = gravity.flatMap { length($0) > 0.5 ? normalize(-$0) : nil }
+        if profile.isolatesHead {
+            let screenUp = deviceFromCamera.map { normalize($0.transpose * SIMD3<Float>(0, 1, 0)) }
+            headUp = Self.headUp(gravity: upHere, screen: screenUp)
+        }
         if profile.findsSupportPlane { supportPlane = SceneSetup.supportPlane(points, up: upHere) }
         backgroundPlanes = Array(SceneSetup.backgroundPlanes(points, excluding: supportPlane).prefix(2))
         // A wall right behind the subject must not be mistaken for the top of a head or pull the volume toward it.
         points = points.filter { p in backgroundPlanes.allSatisfy { $0.distance(p) > Self.backgroundMargin } }
-        if profile.isolatesHead, let head = SceneSetup.head(points, up: upHere) {
+        if profile.isolatesHead, var head = SceneSetup.head(points, up: headUp) {
+            // Whatever the head rests against (pillow, headrest) stays still while it turns; hide it, then look again.
+            let resting = Self.behindHead(head.region)
+            let front = points.filter { dot(resting.normal, $0) + resting.offset > 0 }
+            head = SceneSetup.head(front, up: headUp) ?? head
+            headRest = Self.behindHead(head.region)
             headRegion = head.region
             neckPlane = head.neck
         }
@@ -377,7 +401,13 @@ final class FrameTracker: @unchecked Sendable {
         }
         // The chest stays still while the head turns, so it must not take part in tracking either.
         if let neckPlane { keep(Self.cameraSpace(neckPlane, cameraToWorld: cameraToWorld), margin: icp.config.planeMargin) }
+        if let headRest { keep(headRest.vector, margin: 0) }
         return mask
+    }
+
+    private static func behindHead(_ region: SIMD4<Float>) -> Plane {
+        let center = SIMD3(region.x, region.y, region.z)
+        return Plane(normal: -normalize(center), offset: length(center) + 0.06)
     }
 
     /// A world plane in the camera's space: n_c = Rᵀ n_w, d_c = n_w · t + d_w.
