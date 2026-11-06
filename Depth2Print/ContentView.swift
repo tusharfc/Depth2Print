@@ -44,6 +44,13 @@ struct ContentView: View {
                     }
                 }
                 .pickerStyle(.segmented)
+                if model.mode == .face {
+                    Label(model.usesFaceTracking ? "Face tracking on: turn at a natural pace"
+                                                 : "Face tracking unavailable: turn slowly",
+                          systemImage: model.usesFaceTracking ? "faceid" : "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(model.usesFaceTracking ? .green : .orange)
+                }
                 Picker("Format", selection: $model.format) {
                     ForEach(MeshExportFormat.allCases, id: \.self) { format in
                         Text(format.rawValue.uppercased()).tag(format)
@@ -132,6 +139,7 @@ struct ContentView: View {
                           status.framesLost, status.framesTracked + status.framesLost)
         text += "\n" + status.stageTimings
         if status.followsFace { text += " · face tracking" }
+        if let issue = status.faceTrackingIssue { text += "\nno face tracking: \(issue)" }
         if let reason = status.failureReason { text += "\n\(reason)" }
         return text
     }

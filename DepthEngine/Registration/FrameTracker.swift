@@ -24,6 +24,8 @@ public struct TrackingStatus {
     public let coverage: Float
     /// Face mode: whether ARKit's face tracking is guiding the scan (quick turns are fine then).
     public let followsFace: Bool
+    /// Face mode: why face tracking isn't guiding the scan, if it isn't (nil otherwise).
+    public let faceTrackingIssue: String?
     /// Why the latest frame couldn't be aligned (nil while tracking).
     public let failureReason: String?
     /// Time the phone spent on this frame. Frames arriving meanwhile are skipped, so this sets the tracking rate.
@@ -86,6 +88,7 @@ final class FrameTracker: @unchecked Sendable {
     /// Face mode: the face tracker's head pose at the last tracked frame.
     private var lastHead: HeadPose?
     private(set) var ignoresHeadPose = false
+    private var headPoseSeen = false
 
     /// Whether the depth map has a surface within 3 cm of where the pose puts the nose tip.
     private static func agrees(_ head: HeadPose, with level: FramePyramid.Level) -> Bool {
@@ -176,18 +179,13 @@ final class FrameTracker: @unchecked Sendable {
         }
         let source = current!, model = model!
         guard let volume else {
-            var head = profile.isolatesHead ? head : nil
-            if let pose = head, !Self.agrees(pose, with: source.levels[0]) {
-                // A pose that doesn't sit on the measured face would mislead every frame; scan without it.
-                ignoresHeadPose = true
-                head = nil
-            }
             let status = try start(source, model, depth: depth, intrinsics: intrinsics, time: time, gravity: gravity,
-                                   color: color, head: head)
-            if status.isTracking { lastHead = head }
+                                   color: color, head: profile.isolatesHead ? head : nil)
+            if status.isTracking && !ignoresHeadPose { lastHead = head }
             return status
         }
         let head = ignoresHeadPose ? nil : head
+        headPoseSeen = headPoseSeen || head != nil
 
         let dt = Float(time - lastTrackedTime)
         let axis = turntableAxis.map(referenceSpace)
@@ -383,6 +381,13 @@ final class FrameTracker: @unchecked Sendable {
     private func start(_ source: FramePyramid, _ model: FramePyramid, depth: MTLTexture, intrinsics: CameraIntrinsics,
                        time: Double, gravity: SIMD3<Float>?, color: ColorSampler?, head: HeadPose?) throws -> TrackingStatus {
         try icp.build(source, depth: depth, intrinsics: intrinsics)
+        var head = head
+        headPoseSeen = head != nil
+        if let pose = head, !Self.agrees(pose, with: source.levels[0]) {
+            // A pose that doesn't sit on the measured face would mislead every frame; scan without it.
+            ignoresHeadPose = true
+            head = nil
+        }
         var points = SceneSetup.points(source.levels[1])
         let upHere = gravity.flatMap { length($0) > 0.5 ? normalize(-$0) : nil }
         if profile.isolatesHead {
@@ -560,10 +565,16 @@ final class FrameTracker: @unchecked Sendable {
                        tiltDegrees: tilt * 180 / .pi,
                        degreesPerSecond: length(angularVelocity) * 180 / .pi, isTracking: isTracking,
                        framesTracked: tracked, framesLost: lost, rmse: rmse, coverage: coverage,
-                       followsFace: lastHead != nil, failureReason: failure,
+                       followsFace: lastHead != nil, faceTrackingIssue: faceTrackingIssue, failureReason: failure,
                        processingMilliseconds: (ProcessInfo.processInfo.systemUptime - processingStarted) * 1000,
                        stageTimings: stages.map { String(format: "%@ %.0f", $0.name, $0.ms) }.joined(separator: " · "),
                        preview: preview)
+    }
+
+    private var faceTrackingIssue: String? {
+        guard profile.isolatesHead, lastHead == nil else { return nil }
+        if ignoresHeadPose { return "face pose didn't match depth" }
+        return headPoseSeen ? "face lost by ARKit" : "no face pose from ARKit"
     }
 
     private static func upperLeft(_ m: simd_float4x4) -> simd_float3x3 {
